@@ -1,0 +1,49 @@
+# ============================================
+# REQUIRED DEPENDENCIES for inference_latest.py
+# ============================================
+
+# Computer Vision
+opencv-python>=4.8.0
+
+# YOLO Model Framework
+ultralytics>=8.0.0
+
+# Terminal Colors
+colorama>=0.4.6
+
+# PyTorch (Deep Learning Framework)
+# Choose ONE option based on your setup:
+
+# Option 1: CUDA 11.8 (most common)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Option 2: CUDA 12.1 (uncomment if you have CUDA 12.x)
+# torch>=2.1.0
+# torchvision>=0.16.0
+
+# Option 3: CPU only (uncomment if no GPU)
+# torch>=2.0.0
+# torchvision>=0.15.0
+# Note: For CPU-only PyTorch, visit: https://pytorch.org/get-started/locally/
+
+# Core dependencies (usually auto-installed with ultralytics)
+numpy>=1.24.0
+pillow>=9.0.0
+pyyaml>=6.0
+
+# ============================================
+# OPTIONAL DEPENDENCIES (for upload features)
+# ============================================
+
+# AWS SDK for S3 uploads (only needed if ENABLE_UPLOADS environment variable is set)
+boto3>=1.28.0
+
+# HTTP requests for API calls (only needed if ENABLE_UPLOADS environment variable is set)
+requests>=2.31.0
+
+# ============================================
+# OPTIONAL: Performance Monitoring
+# ============================================
+
+psutil>=5.9.0
