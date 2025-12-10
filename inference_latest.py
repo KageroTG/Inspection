@@ -9,7 +9,7 @@ import concurrent.futures
 import random
 from datetime import timezone, timedelta, datetime
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List, Set
+from typing import Optional, Tuple, Dict, Any, List
 from dotenv import load_dotenv
 
 import cv2
@@ -36,7 +36,7 @@ print("ENV CHECK END")
 init(autoreset=True)
 
 # Configuration
-VIDEO_PATH = "videos\Gen720p.mp4"  # Change to your video path
+VIDEO_PATH = "Ipoh to KL - 15minutes.mp4"  # Change to your video path
 MODEL_PATH = "best.pt"  # Change to your model path
 RESIZE_PERCENT = 65  # Resize frames for faster processing
 CONFIDENCE_THRESHOLD = 0.5
@@ -99,7 +99,7 @@ AWS_BASE_URL = os.environ.get(
 API_URL = os.environ.get(
     "API_URL", "https://mizube.oud.ai/api/users/DemoDashboard"
 )
-CLASS_TYPE_MAP = {"potholes": "001"}
+CLASS_TYPE_MAP = {"crack": "005"}
 UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))
 
 if ENABLE_UPLOADS:
@@ -145,351 +145,234 @@ upload_manager = UploadManager()
 
 
 MYT = timezone(timedelta(hours=8))
-
-class CrackUploadScheduler:
-    """Buffer crack detections and upload after a cooldown window."""
-
-    def __init__(self, delay_seconds: float = 3.0, no_track_merge_window: float = 0.5):
-        self.delay_seconds = delay_seconds
-        self.no_track_merge_window = no_track_merge_window  # Merge no-track detections within this window
-        self._lock = threading.Lock()
-        self._pending: Dict[Any, Dict[str, Any]] = {}
-        self._active_timers: Dict[Any, threading.Timer] = {}
-        self._no_track_counter = 0
-        self._upload_in_progress: Set[Any] = set()
-        self._last_no_track_time = 0  # Track last no-track detection time
-
-    def _make_key(self, detection: Dict[str, Any]) -> Any:
-        track_id = detection.get("track_id")
-        if track_id is not None:
-            return ("track", int(track_id))
-        
-        # For no-track detections, merge if they occur within merge window
-        current_time = time.time()
-        if current_time - self._last_no_track_time < self.no_track_merge_window:
-            # Reuse the same counter (merge with previous)
-            LOGGER.info(
-                f"NO_TRACK_MERGED time_diff={current_time - self._last_no_track_time:.3f}s "
-                f"using_counter={self._no_track_counter}"
-            )
-        else:
-            # New detection window, increment counter
-            self._no_track_counter += 1
-            self._last_no_track_time = current_time
-        
-        return ("no_track", self._no_track_counter)
-
-    def _delayed_upload(self, key: Any) -> None:
-        """Upload after delay (called by Timer)."""
-        payload = None
-        
-        with self._lock:
-            # Double-check: verify this timer is still the active one
-            if key not in self._active_timers:
-                LOGGER.warning(f"CRACK_UPLOAD_ABORTED key={key} reason=timer_cancelled_before_execution")
-                return
-            
-            # Check if upload already in progress for this key
-            if key in self._upload_in_progress:
-                LOGGER.warning(f"CRACK_UPLOAD_ABORTED key={key} reason=upload_already_in_progress")
-                self._active_timers.pop(key, None)
-                return
-            
-            # Mark upload as in progress
-            self._upload_in_progress.add(key)
-            
-            payload = self._pending.pop(key, None)
-            self._active_timers.pop(key, None)
-
-        if not payload:
-            with self._lock:
-                self._upload_in_progress.discard(key)
-            LOGGER.warning(f"CRACK_UPLOAD_ABORTED key={key} reason=no_payload")
-            return
-
-        if upload_executor is None:
-            with self._lock:
-                self._upload_in_progress.discard(key)
-            LOGGER.warning(f"CRACK_UPLOAD_ABORTED key={key} reason=uploads_disabled")
-            return
-
-        detection = payload["detection"]
-        label = detection["class_name"]
-        track_id = detection.get("track_id")
-
-        # Final check: has this already been uploaded?
-        if not upload_manager.should_upload(label, track_id):
-            with self._lock:
-                self._upload_in_progress.discard(key)
-            LOGGER.warning(
-                "CRACK_UPLOAD_SKIPPED_DUPLICATE label=%s track_id=%s key=%s",
-                label,
-                track_id if track_id is not None else "NA",
-                key,
-            )
-            return
-
-        LOGGER.info(
-            "CRACK_UPLOAD_EXECUTING label=%s track_id=%s key=%s delay=%ss",
-            label,
-            track_id if track_id is not None else "NA",
-            key,
-            self.delay_seconds,
-        )
-
-        try:
-            # Perform the upload
-            upload_image(
-                payload["frame"],
-                label,
-                None,
-                track_id,
-                detection.get("confidence"),
-                payload["annotations_drawn"],
-            )
-            LOGGER.info(
-                "CRACK_UPLOAD_SUCCESS label=%s track_id=%s key=%s",
-                label,
-                track_id if track_id is not None else "NA",
-                key,
-            )
-        except Exception as e:
-            LOGGER.exception(
-                "CRACK_UPLOAD_FAILED label=%s track_id=%s key=%s error=%s",
-                label,
-                track_id if track_id is not None else "NA",
-                key,
-                e,
-            )
-        finally:
-            # Always remove from in-progress set
-            with self._lock:
-                self._upload_in_progress.discard(key)
-
-    def add_detection(self, frame, detection: Dict[str, Any], annotations_drawn: int) -> None:
-        """Add or update a crack detection."""
-        track_id = detection.get("track_id")
-        
-        with self._lock:
-            # Generate key
-            if track_id is None:
-                key = self._make_key(detection)
-                LOGGER.debug(f"CRACK_NO_TRACK_ID assigned_key={key}")
-            else:
-                key = ("track", int(track_id))
-            
-            # Check if upload already in progress for this key
-            if key in self._upload_in_progress:
-                LOGGER.warning(
-                    f"CRACK_DETECTION_IGNORED key={key} track_id={track_id} "
-                    f"reason=upload_in_progress"
-                )
-                return
-            
-            # Update or create pending detection
-            self._pending[key] = {
-                "frame": frame.copy(),
-                "detection": detection.copy(),
-                "annotations_drawn": annotations_drawn,
-            }
-            
-            # If there's already an active timer, just update the pending and log
-            if key in self._active_timers:
-                LOGGER.info(
-                    f"CRACK_DETECTION_UPDATED key={key} track_id={track_id} "
-                    f"reason=timer_already_running"
-                )
-                return
-            
-            # Otherwise, create and start a new timer
-            new_timer = threading.Timer(self.delay_seconds, self._delayed_upload, args=(key,))
-            new_timer.daemon = True
-            self._active_timers[key] = new_timer
-            new_timer.start()
-            
-            LOGGER.info(
-                f"CRACK_TIMER_STARTED key={key} track_id={track_id} delay={self.delay_seconds}s "
-                f"pending_count={len(self._pending)} active_timers={len(self._active_timers)}"
-            )
-
-    def shutdown(self):
-        """Cancel all pending timers (call on program exit)."""
-        with self._lock:
-            cancelled_count = len(self._active_timers)
-            for timer in self._active_timers.values():
-                timer.cancel()
-            self._active_timers.clear()
-            self._pending.clear()
-            LOGGER.info(
-                f"CRACK_SCHEDULER_SHUTDOWN cancelled_timers={cancelled_count} "
-                f"uploads_in_progress={len(self._upload_in_progress)}"
-            )
+IMAGES_DIR = "images"
+CRACK_LABELS = {"crack", "cracks"}
 
 
-# Initialize with merge window
-CRACK_UPLOAD_DELAY_SECONDS = 3.0
-crack_scheduler = CrackUploadScheduler(
-    delay_seconds=CRACK_UPLOAD_DELAY_SECONDS,
-    no_track_merge_window=0.5  # Merge no-track detections within 500ms
-)
+def normalize_label(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
 
 
-# Replace your upload_image function with this:
-def upload_image(
-    frame,
+def build_payload(
     class_name: str,
+    image_url: str,
     gps_coords: Optional[Tuple[float, float]] = None,
-    track_id: Optional[int] = None,
-    confidence: Optional[float] = None,
-    annotations_drawn: int = 0,
-) -> None:
-    """Save annotated frame locally, push to S3, then post metadata to dashboard."""
-    if not ENABLE_UPLOADS or upload_executor is None or s3_client is None:
-        return
-
-    # Generate truly unique filename with MYT timestamp + microseconds + random
-    now = datetime.now(MYT)  # Use Malaysia Time
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
-    microseconds = now.microsecond
-    random_suffix = random.randint(1000, 9999)
-    
-
-# Initialize
-CRACK_UPLOAD_DELAY_SECONDS = 3.0
-crack_scheduler = CrackUploadScheduler(delay_seconds=CRACK_UPLOAD_DELAY_SECONDS)
-upload_manager = UploadManager()
-
-
-def upload_image(
-    frame,
-    class_name: str,
-    gps_coords: Optional[Tuple[float, float]] = None,
-    track_id: Optional[int] = None,
-    confidence: Optional[float] = None,
-    annotations_drawn: int = 0,
-) -> None:
-    """Save annotated frame locally, push to S3, then post metadata to dashboard."""
-    if not ENABLE_UPLOADS or upload_executor is None or s3_client is None:
-        return
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename_rel = os.path.join("images", f"{class_name}-{timestamp}.jpg")
-    s3_key = os.path.basename(filename_rel)
-    path_img = os.path.join(os.getcwd(), filename_rel)
-
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     latitude = f"{gps_coords[0]:.6f}" if gps_coords else "N/A"
     longitude = f"{gps_coords[1]:.6f}" if gps_coords else "N/A"
+    normalized = normalize_label(class_name)
 
-    detection = {
-        "typ": CLASS_TYPE_MAP.get(class_name, "000"),
+    payload: Dict[str, Any] = {
+        "typ": CLASS_TYPE_MAP.get(normalized, "000"),
         "detect": class_name,
-        "img": f"{AWS_BASE_URL}/{s3_key}",
+        "img": image_url,
         "cam_loc": [latitude, longitude],
     }
 
-    LOGGER.info(
-        "UPLOAD_START label=%s track_id=%s confidence=%s file=%s annotated_boxes=%s",
-        class_name,
-        track_id if track_id is not None else "NA",
-        f"{confidence:.2f}" if confidence is not None else "NA",
-        filename_rel,
-        annotations_drawn,
-    )
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def delete_file_safely(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            LOGGER.info("LOCAL_CLEANUP_SUCCESS path=%s", path)
+    except Exception as exc:
+        LOGGER.warning("LOCAL_CLEANUP_FAILED path=%s error=%s", path, exc)
+
+
+def persist_frame_to_s3(frame, class_name: str) -> Optional[Dict[str, str]]:
+    if s3_client is None:
+        return None
+
+    now = datetime.now(MYT)
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    unique_suffix = f"{now.microsecond}_{random.randint(1000, 9999)}"
+    filename = f"{class_name}-{timestamp}-{unique_suffix}.jpg"
+    local_path = os.path.join(IMAGES_DIR, filename)
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+
+    if not cv2.imwrite(local_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85]):
+        LOGGER.error("LOCAL_SAVE_FAILED path=%s", local_path)
+        return None
 
     try:
-        os.makedirs(os.path.dirname(filename_rel), exist_ok=True)
-    except Exception as e:
-        LOGGER.exception("LOCAL_SAVE_PREP_FAILED path=%s error=%s", filename_rel, e)
-        return
+        s3_client.upload_file(local_path, AWS_BUCKET, filename)
+        LOGGER.info("S3_UPLOAD_SUCCESS bucket=%s key=%s", AWS_BUCKET, filename)
+    except Exception as exc:
+        LOGGER.exception("S3_UPLOAD_FAILED bucket=%s key=%s error=%s", AWS_BUCKET, filename, exc)
+        delete_file_safely(local_path)
+        return None
 
-    save_ok = cv2.imwrite(filename_rel, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if not save_ok:
-        LOGGER.error("LOCAL_SAVE_FAILED path=%s", filename_rel)
-        return
-    LOGGER.info("LOCAL_SAVE_SUCCESS path=%s", filename_rel)
+    return {
+        "local_path": local_path,
+        "s3_key": filename,
+        "url": f"{AWS_BASE_URL}/{filename}",
+    }
 
-    s3_uploaded = False
-    try:
-        s3_client.upload_file(path_img, AWS_BUCKET, s3_key)
-        s3_uploaded = True
-        LOGGER.info("S3_UPLOAD_SUCCESS bucket=%s key=%s", AWS_BUCKET, s3_key)
-    except Exception as e:
-        LOGGER.exception("S3_UPLOAD_FAILED bucket=%s key=%s error=%s", AWS_BUCKET, s3_key, e)
 
-    def post_metadata() -> None:
-        for attempt in range(1, 4):
-            try:
-                LOGGER.info(
-                    "API_POST attempt=%s label=%s track_id=%s url=%s payload=%s",
-                    attempt,
-                    class_name,
-                    track_id if track_id is not None else "NA",
-                    API_URL,
-                    detection,
-                )
-                resp = requests.post(API_URL, json=detection, timeout=6)
-                resp.raise_for_status()
-                LOGGER.info(
-                    "API_POST_SUCCESS attempt=%s status_code=%s label=%s track_id=%s",
-                    attempt,
-                    resp.status_code,
-                    class_name,
-                    track_id if track_id is not None else "NA",
-                )
-                try:
-                    if os.path.exists(path_img):
-                        os.remove(path_img)
-                        LOGGER.info("LOCAL_CLEANUP_SUCCESS path=%s", path_img)
-                except Exception as ce:
-                    LOGGER.warning("LOCAL_CLEANUP_FAILED path=%s error=%s", path_img, ce)
-                return
-            except Exception as e:
-                LOGGER.warning(
-                    "API_POST_FAILED attempt=%s label=%s track_id=%s error=%s",
-                    attempt,
-                    class_name,
-                    track_id if track_id is not None else "NA",
-                    str(e),
-                )
-                time.sleep(2)
-
-        err_file = f"failed_uploads_{timestamp}.json"
+def post_to_dashboard(
+    payload: Dict[str, Any],
+    track_id: Optional[int] = None,
+    local_path: Optional[str] = None,
+    retries: int = 3,
+) -> bool:
+    for attempt in range(1, retries + 1):
         try:
-            with open(err_file, "w") as f:
-                json.dump({"detection": detection}, f)
-            LOGGER.error("API_POST_GAVE_UP label=%s track_id=%s record=%s", class_name, track_id, err_file)
-        except Exception as fe:
-            LOGGER.exception("API_POST_SAVE_FAILED file=%s error=%s", err_file, fe)
+            LOGGER.info(
+                "API_POST attempt=%s track_id=%s url=%s payload=%s",
+                attempt,
+                track_id if track_id is not None else "NA",
+                API_URL,
+                payload,
+            )
+            response = requests.post(API_URL, json=payload, timeout=6)
+            response.raise_for_status()
+            LOGGER.info(
+                "API_POST_SUCCESS attempt=%s status_code=%s track_id=%s",
+                attempt,
+                response.status_code,
+                track_id if track_id is not None else "NA",
+            )
+            delete_file_safely(local_path)
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "API_POST_FAILED attempt=%s track_id=%s error=%s",
+                attempt,
+                track_id if track_id is not None else "NA",
+                exc,
+            )
+            time.sleep(2)
 
-    if s3_uploaded:
-        post_metadata()
-    else:
-        LOGGER.warning("SKIP_API_POST label=%s track_id=%s reason=S3_failed", class_name, track_id)
+    error_file = f"failed_upload_{int(time.time())}.json"
+    try:
+        with open(error_file, "w") as handle:
+            json.dump({"payload": payload, "track_id": track_id}, handle)
+        LOGGER.error("API_POST_GAVE_UP track_id=%s saved=%s", track_id, error_file)
+    except Exception as exc:
+        LOGGER.exception("API_POST_SAVE_FAILED file=%s error=%s", error_file, exc)
+    return False
 
 
-def schedule_uploads(frame, detections: List[Dict[str, Any]], total_boxes: int) -> None:
-    """Queue uploads for current frame detections."""
+def upload_immediate_detection(frame, detection: Dict[str, Any]) -> None:
+    image_info = persist_frame_to_s3(frame, detection["class_name"])
+    if not image_info:
+        return
+
+    payload = build_payload(detection["class_name"], image_info["url"])
+    post_to_dashboard(payload, detection.get("track_id"), image_info["local_path"])
+
+
+class CrackBatcher:
+    """Aggregate crack detections for batched dashboard uploads."""
+
+    def __init__(self, delay_seconds: float = 20.0):
+        self.delay_seconds = delay_seconds
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+        self._pending_payload: Optional[Dict[str, Any]] = None
+        self._pending_local_path: Optional[str] = None
+        self._pending_track_id: Optional[int] = None
+        self._count = 0
+
+    def add_detection(self, frame, detection: Dict[str, Any]) -> None:
+        image_info = persist_frame_to_s3(frame, detection["class_name"])
+        if not image_info:
+            return
+
+        payload = build_payload(
+            detection["class_name"],
+            image_info["url"],
+        )
+        track_id = detection.get("track_id")
+
+        with self._lock:
+            self._count += 1
+            payload["count"] = self._count
+
+            if self._pending_local_path and self._pending_local_path != image_info["local_path"]:
+                delete_file_safely(self._pending_local_path)
+
+            self._pending_payload = payload
+            self._pending_local_path = image_info["local_path"]
+            self._pending_track_id = track_id
+
+            if self._timer:
+                self._timer.cancel()
+
+            self._timer = threading.Timer(self.delay_seconds, self._flush)
+            self._timer.daemon = True
+            self._timer.start()
+
+            LOGGER.info(
+                "CRACK_BUFFER_UPDATED count=%s delay=%ss",
+                self._count,
+                self.delay_seconds,
+            )
+
+    def _flush(self) -> None:
+        payload: Optional[Dict[str, Any]] = None
+        local_path: Optional[str] = None
+        track_id: Optional[int] = None
+
+        with self._lock:
+            payload = self._pending_payload
+            local_path = self._pending_local_path
+            track_id = self._pending_track_id
+            self._pending_payload = None
+            self._pending_local_path = None
+            self._pending_track_id = None
+            self._count = 0
+            self._timer = None
+
+        if not payload:
+            return
+
+        LOGGER.info("CRACK_BATCH_SENDING payload=%s", payload)
+        post_to_dashboard(payload, track_id, local_path)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            payload = self._pending_payload
+            local_path = self._pending_local_path
+            track_id = self._pending_track_id
+            self._pending_payload = None
+            self._pending_local_path = None
+            self._pending_track_id = None
+            self._count = 0
+
+        if payload:
+            LOGGER.info("CRACK_BATCH_FLUSH_ON_SHUTDOWN payload=%s", payload)
+            post_to_dashboard(payload, track_id, local_path)
+
+
+crack_batcher = CrackBatcher(delay_seconds=20.0)
+
+
+def schedule_uploads(frame, detections: List[Dict[str, Any]]) -> None:
     if not ENABLE_UPLOADS or upload_executor is None:
         return
-    for det in detections:
-        label = det["class_name"]
-        track_id = det["track_id"]
 
-        if label == "cracks":
-            crack_scheduler.add_detection(frame, det, total_boxes)
-            continue
+    for det in detections:
+        label = normalize_label(det["class_name"])
+        track_id = det["track_id"]
 
         if not upload_manager.should_upload(label, track_id):
             continue
-        upload_executor.submit(
-            upload_image,
-            frame.copy(),
-            label,
-            None,
-            track_id,
-            det["confidence"],
-            total_boxes,
-        )
+
+        if label in CRACK_LABELS:
+            upload_executor.submit(crack_batcher.add_detection, frame.copy(), det)
+        else:
+            upload_executor.submit(upload_immediate_detection, frame.copy(), det)
 
 
 class VideoReader:
@@ -929,7 +812,6 @@ def main():
                 schedule_uploads(
                     annotated_frame,
                     upload_candidates,
-                    num_detections
                 )
             
             # Save to output video if enabled
@@ -996,8 +878,8 @@ def main():
                 pass
 
         if ENABLE_UPLOADS:
-            crack_scheduler.shutdown()
-            LOGGER.info("Crack upload scheduler shut down")
+            crack_batcher.shutdown()
+            LOGGER.info("Crack batcher shut down")
 
         if upload_executor is not None:
             upload_executor.shutdown(wait=True)

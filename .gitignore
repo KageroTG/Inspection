@@ -1,0 +1,6 @@
+.venv/
+.env
+__pycache__/
+Ipoh to KL - 15minutes.mp4
+*.log
+best.pt
