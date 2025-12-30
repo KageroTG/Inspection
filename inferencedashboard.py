@@ -1,16 +1,15 @@
 import os
 import sys
 import time
-import queue
 import threading
 import logging
 import json
 import random
 from datetime import timezone, timedelta, datetime
-from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List
-from dotenv import load_dotenv
+from typing import Optional, Dict, Any, List, Callable
+from concurrent.futures import ThreadPoolExecutor
 
+from dotenv import load_dotenv
 import cv2
 import boto3
 import requests
@@ -19,282 +18,371 @@ from colorama import init, Fore
 
 try:
     import torch
-except ImportError:
+except ImportError:  # pragma: no cover - torch may be missing on some deployments
     torch = None
 
+
 load_dotenv()
-
-print("ENV CHECK START")
-print("ROBOLYZE_API_KEY =", os.environ.get("ROBOLYZE_API_KEY"))
-print("ROBOLYZE_API_URL =", os.environ.get("ROBOLYZE_API_URL"))
-print("AWS_KEY =", os.environ.get("AWS_ACCESS_KEY_ID"))
-print("AWS_SECRET =", os.environ.get("AWS_SECRET_ACCESS_KEY"))
-print("ENV CHECK END")
-
 init(autoreset=True)
 
+
+# ---------------------------------------------------------------------------
 # Configuration
-VIDEO_PATH = "Videos/IpohtoKL15minutes.mp4"
-MODEL_PATH = "best.pt"
-RESIZE_PERCENT = 65
-CONFIDENCE_THRESHOLD = 0.5
-IOU_THRESHOLD = 0.4
+# ---------------------------------------------------------------------------
 LOG_DIR = "logs"
-RESULTS_DIR = "results"
-SHOW_WINDOW = True
-SAVE_OUTPUT_VIDEO = False
-SAVE_METADATA = True
+IMAGES_DIR = "images"
+MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
+CAMERA_SOURCE_RAW = os.getenv("CAMERA_SOURCE", "Ipoh to KL - 15minutes.mp4")
+CAMERA_WIDTH = os.getenv("CAMERA_WIDTH")
+CAMERA_HEIGHT = os.getenv("CAMERA_HEIGHT")
+RECONNECT_DELAY = float(os.getenv("CAMERA_RECONNECT_DELAY", "1.5"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.35"))
+IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.4"))
+UPLOAD_WORKERS = max(1, int(os.getenv("UPLOAD_WORKERS", "4")))
+CRACK_UPLOAD_DELAY = float(os.getenv("CRACK_UPLOAD_DELAY", "5.0"))
+PERF_LOG_INTERVAL = float(os.getenv("PERF_LOG_INTERVAL", "5.0"))
+SHOW_WINDOW = os.getenv("SHOW_WINDOW", "1") == "1"
 
-# GPU Configuration
-USE_GPU = True
-DEVICE = None
+# Detection configuration
+COMPANY_ID = os.getenv("ROBOCOMPANY_ID", "1005")
+LOCATION = os.getenv("ROBOLOCATION", "1111110000.1551331")
+DETECTION_TYPE = os.getenv("ROBODETECTION_TYPE", "RoAd")
 
-if USE_GPU:
-    if torch is None:
-        print(Fore.YELLOW + "Warning: PyTorch not installed. Falling back to CPU.")
-        DEVICE = "cpu"
-    elif not torch.cuda.is_available():
-        print(Fore.YELLOW + "Warning: CUDA not available. Falling back to CPU.")
-        DEVICE = "cpu"
-    else:
+
+def _parse_label_set(raw: Optional[str], fallback: List[str]) -> set:
+    if not raw:
+        return {item.strip().lower() for item in fallback if item.strip()}
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+IMMEDIATE_UPLOAD_LABELS = _parse_label_set(
+    os.getenv("PRIORITY_CLASSES"),
+    ["pothole", "potholes", "raveling"],
+)
+CRACK_LABELS = _parse_label_set(
+    os.getenv("CRACK_CLASSES"),
+    ["crack", "cracks"],
+)
+INTERESTING_LABELS = IMMEDIATE_UPLOAD_LABELS | CRACK_LABELS
+
+
+# API / AWS configuration
+API_URL = os.getenv("ROBOLYZE_API_URL")
+API_KEY = os.getenv("ROBOLYZE_API_KEY")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_BUCKET = os.getenv("AWS_BUCKET", "robolyzedatamy")
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-5")
+AWS_BASE_URL = os.getenv(
+    "AWS_BASE_URL",
+    f"https://{AWS_BUCKET}.s3.{AWS_REGION}.amazonaws.com",
+)
+
+
+# GPU configuration
+USE_GPU = os.getenv("USE_GPU", "1") == "1"
+DEVICE: Optional[str]
+if USE_GPU and torch is not None:
+    if torch.cuda.is_available():
         DEVICE = "cuda:0"
         try:
             torch.cuda.set_device(0)
-            print(Fore.GREEN + f"✓ GPU detected: {torch.cuda.get_device_name(0)}")
             torch.backends.cudnn.benchmark = True
-        except Exception as e:
-            print(Fore.YELLOW + f"Warning: GPU setup failed ({e}). Using CPU.")
+            print(Fore.GREEN + f"✓ GPU detected: {torch.cuda.get_device_name(0)}")
+        except Exception as exc:  # pragma: no cover - protective log
+            print(Fore.YELLOW + f"GPU setup failed ({exc}). Using CPU instead.")
             DEVICE = "cpu"
+    else:
+        print(Fore.YELLOW + "CUDA not available. Using CPU.")
+        DEVICE = "cpu"
 else:
+    if USE_GPU and torch is None:
+        print(Fore.YELLOW + "PyTorch not installed. Using CPU.")
     DEVICE = "cpu"
-    print(Fore.YELLOW + "GPU usage disabled. Using CPU.")
 
 print(Fore.CYAN + f"Device set to: {DEVICE}\n")
 
-# Create directories
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# Setup logging
+# ---------------------------------------------------------------------------
+# Logging setup and directory creation
+# ---------------------------------------------------------------------------
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(f'{LOG_DIR}/test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(os.path.join(LOG_DIR, f"edge_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
-LOGGER = logging.getLogger("video_tester")
+LOGGER = logging.getLogger("edge_inference")
 
-# NEW API Configuration (from .env)
-API_URL = os.getenv("ROBOLYZE_API_URL")
-API_KEY = os.getenv("ROBOLYZE_API_KEY")
 
-# AWS S3 Configuration (from .env)
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_BUCKET = "robolyzedatamy"
-AWS_BASE_URL = "https://robolyzedatamy.s3.ap-southeast-5.amazonaws.com"
-AWS_REGION = "ap-southeast-5"
-
-# Detection Configuration
-COMPANY_ID = "1005"
-LOCATION = "1111110000.1551331"
-DETECTION_TYPE = "RoAd"
-
-# Class names mapping (adjust based on your model)
-CLASS_NAMES = {
-    0: "no-vest",
-    1: "no-helmet",
-    2: "no-boots",
-}
-
-# Validate environment
-if not API_KEY or not API_URL:
-    LOGGER.error("Missing ROBOLYZE_API_KEY or ROBOLYZE_API_URL in .env")
+# ---------------------------------------------------------------------------
+# Environment validation
+# ---------------------------------------------------------------------------
+if not API_URL or not API_KEY:
+    LOGGER.error("Missing ROBOLYZE_API_URL or ROBOLYZE_API_KEY in environment")
     sys.exit(1)
 
 if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
-    LOGGER.error("Missing AWS credentials in .env")
+    LOGGER.error("Missing AWS credentials in environment")
     sys.exit(1)
 
-# Initialize S3 client
+
+# ---------------------------------------------------------------------------
+# AWS client + time helpers
+# ---------------------------------------------------------------------------
 try:
     s3_client = boto3.client(
-        's3',
+        "s3",
         aws_access_key_id=AWS_ACCESS_KEY,
         aws_secret_access_key=AWS_SECRET_KEY,
-        region_name=AWS_REGION
+        region_name=AWS_REGION,
     )
-    LOGGER.info(f"✓ S3 client initialized: {AWS_BUCKET}")
-except Exception as e:
-    LOGGER.error(f"Failed to initialize S3: {e}")
+    LOGGER.info("✓ S3 client ready for bucket %s", AWS_BUCKET)
+except Exception as exc:
+    LOGGER.error("Failed to create S3 client: %s", exc)
     sys.exit(1)
 
 MYT = timezone(timedelta(hours=8))
-IMAGES_DIR = "images"
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+def _parse_camera_source(raw: str):
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _parse_int(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+CAMERA_SOURCE = _parse_camera_source(CAMERA_SOURCE_RAW)
+CAMERA_WIDTH_VALUE = _parse_int(CAMERA_WIDTH)
+CAMERA_HEIGHT_VALUE = _parse_int(CAMERA_HEIGHT)
 
 
 class UploadManager:
-    """Prevent duplicate uploads for the same label/track."""
+    """Prevent duplicate uploads for the same label/track pair."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._seen = set()
         self._lock = threading.Lock()
 
-    def should_upload(self, label: Optional[str], track_id: Optional[int]) -> bool:
+    def should_upload(self, label: str, track_id: Optional[int]) -> bool:
         if track_id is None:
             return True
-        key = (label or "", int(track_id))
+        key = (label, int(track_id))
         with self._lock:
             if key in self._seen:
-                LOGGER.warning(
-                    f"DUPLICATE_PREVENTED label={label} track_id={track_id} (already uploaded)"
-                )
+                LOGGER.debug("Duplicate suppressed label=%s track_id=%s", label, track_id)
                 return False
             self._seen.add(key)
-            LOGGER.info(f"UPLOAD_ALLOWED label={label} track_id={track_id}")
             return True
 
 
 upload_manager = UploadManager()
 
 
-def normalize_label(name: Optional[str]) -> str:
-    """Normalize class label to lowercase."""
-    return (name or "").strip().lower()
+class CameraStream:
+    """Thin wrapper around cv2.VideoCapture that supports files and live cameras."""
+
+    def __init__(self, source, width: Optional[int], height: Optional[int], reconnect_delay: float):
+        self.source = source
+        self.width = width
+        self.height = height
+        self.reconnect_delay = reconnect_delay
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.is_video_file = isinstance(source, str) and os.path.isfile(source)
+        self._finished = False
+        self._open()
+
+    def _open(self) -> None:
+        if self.cap:
+            self.cap.release()
+        self._finished = False
+        self.cap = cv2.VideoCapture(self.source)
+        if self.width:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        if self.height:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Unable to open camera source: {self.source}")
+        LOGGER.info(
+            "Stream ready source=%s resolution=%sx%s",
+            self.source,
+            self.width or "auto",
+            self.height or "auto",
+        )
+
+    def read(self) -> Optional[Any]:
+        if self.cap is None:
+            self._open()
+        if self._finished:
+            return None
+        ret, frame = self.cap.read()
+        if ret:
+            return frame
+        if self.is_video_file:
+            LOGGER.info("Video source %s finished", self.source)
+            self._finished = True
+            return None
+        LOGGER.warning("Camera frame missing. Reconnecting in %.1fs", self.reconnect_delay)
+        time.sleep(self.reconnect_delay)
+        try:
+            self._open()
+        except Exception as exc:
+            LOGGER.error("Failed to reopen camera: %s", exc)
+            return None
+        ret, frame = self.cap.read()
+        return frame if ret else None
+
+    def release(self) -> None:
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+            LOGGER.info("Camera stream released")
+
+    def is_finished(self) -> bool:
+        return self._finished
 
 
-# Define crack labels for batching
-CRACK_LABELS = {"crack", "cracks"}
+class PerformanceMonitor:
+    """Track FPS and log periodically."""
+
+    def __init__(self, log_interval: float):
+        self.total_frames = 0
+        self.current_fps = 0.0
+        self._window_frames = 0
+        self._last_fps_time = time.time()
+        self._last_log_time = time.time()
+        self.log_interval = log_interval
+
+    def next_frame_index(self) -> int:
+        return self.total_frames + 1
+
+    def update(self, detections: int) -> None:
+        self.total_frames += 1
+        self._window_frames += 1
+        now = time.time()
+        elapsed = now - self._last_fps_time
+        if elapsed >= 1.0:
+            self.current_fps = self._window_frames / elapsed
+            self._window_frames = 0
+            self._last_fps_time = now
+        if now - self._last_log_time >= self.log_interval:
+            LOGGER.info(
+                "PERF frames=%s fps=%.2f detections_this_frame=%s",
+                self.total_frames,
+                self.current_fps,
+                detections,
+            )
+            self._last_log_time = now
 
 
 class CrackBatcher:
-    """Aggregate crack detections for batched dashboard uploads."""
+    """Hold latest crack detection for a short delay before uploading."""
 
-    def __init__(self, delay_seconds: float = 5.0):
+    def __init__(self, delay_seconds: float, upload_callback: Callable[[Any, Dict[str, Any], int, bool], None]):
         self.delay_seconds = delay_seconds
+        self._upload_callback = upload_callback
         self._lock = threading.Lock()
         self._timer: Optional[threading.Timer] = None
-        self._pending_payload: Optional[Dict[str, Any]] = None
-        self._pending_local_path: Optional[str] = None
-        self._pending_track_id: Optional[int] = None
-        self._count = 0
+        self._payload: Optional[tuple] = None
 
     def add_detection(self, frame, detection: Dict[str, Any], frame_count: int) -> None:
-        image_info = persist_frame_to_s3(frame, detection["class_name"], frame_count)
-        if not image_info:
-            return
-
-        payload = build_payload(
-            detection["class_name"],
-            image_info["url"],
-            frame_count,
-        )
-        track_id = detection.get("track_id")
-
         with self._lock:
-            self._count += 1
-            payload["count"] = self._count
-
-            if self._pending_local_path and self._pending_local_path != image_info["local_path"]:
-                delete_file_safely(self._pending_local_path)
-
-            self._pending_payload = payload
-            self._pending_local_path = image_info["local_path"]
-            self._pending_track_id = track_id
-
+            self._payload = (frame.copy(), detection.copy(), frame_count)
             if self._timer:
                 self._timer.cancel()
-
             self._timer = threading.Timer(self.delay_seconds, self._flush)
             self._timer.daemon = True
             self._timer.start()
-
             LOGGER.info(
-                "CRACK_BUFFER_UPDATED count=%s delay=%ss",
-                self._count,
+                "CRACK_BUFFER label=%s track_id=%s delay=%.1fs",
+                detection.get("class_name"),
+                detection.get("track_id"),
                 self.delay_seconds,
             )
 
     def _flush(self) -> None:
-        payload: Optional[Dict[str, Any]] = None
-        local_path: Optional[str] = None
-        track_id: Optional[int] = None
-
         with self._lock:
-            payload = self._pending_payload
-            local_path = self._pending_local_path
-            track_id = self._pending_track_id
-            self._pending_payload = None
-            self._pending_local_path = None
-            self._pending_track_id = None
-            self._count = 0
+            payload = self._payload
+            self._payload = None
             self._timer = None
-
         if not payload:
             return
-
-        LOGGER.info("CRACK_BATCH_SENDING payload=%s", payload)
-        post_to_dashboard(payload, track_id, local_path)
+        frame, detection, frame_count = payload
+        LOGGER.info(
+            "CRACK_FLUSH frame=%s label=%s track_id=%s",
+            frame_count,
+            detection.get("class_name"),
+            detection.get("track_id"),
+        )
+        self._upload_callback(frame, detection, frame_count, True)
 
     def shutdown(self) -> None:
         with self._lock:
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
-            payload = self._pending_payload
-            local_path = self._pending_local_path
-            track_id = self._pending_track_id
-            self._pending_payload = None
-            self._pending_local_path = None
-            self._pending_track_id = None
-            self._count = 0
-
+            payload = self._payload
+            self._payload = None
         if payload:
-            LOGGER.info("CRACK_BATCH_FLUSH_ON_SHUTDOWN payload=%s", payload)
-            post_to_dashboard(payload, track_id, local_path)
+            frame, detection, frame_count = payload
+            LOGGER.info(
+                "CRACK_SHUTDOWN_FLUSH frame=%s label=%s track_id=%s",
+                frame_count,
+                detection.get("class_name"),
+                detection.get("track_id"),
+            )
+            self._upload_callback(frame, detection, frame_count, True)
 
 
-crack_batcher = CrackBatcher(delay_seconds=5.0)
+def normalize_label(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
 
 
 def delete_file_safely(path: Optional[str]) -> None:
-    """Safely delete a local file."""
     if not path:
         return
     try:
         if os.path.exists(path):
             os.remove(path)
-            LOGGER.info("LOCAL_CLEANUP_SUCCESS path=%s", path)
+            LOGGER.debug("Deleted temporary file %s", path)
     except Exception as exc:
-        LOGGER.warning("LOCAL_CLEANUP_FAILED path=%s error=%s", path, exc)
+        LOGGER.warning("Failed to delete %s: %s", path, exc)
 
 
 def persist_frame_to_s3(frame, class_name: str, frame_count: int) -> Optional[Dict[str, str]]:
-    """Upload frame to S3 and return metadata."""
-    if s3_client is None:
-        return None
-
     now = datetime.now(MYT)
     timestamp = now.strftime("%Y%m%d_%H%M%S")
     unique_suffix = f"{now.microsecond}_{random.randint(1000, 9999)}"
     filename = f"{class_name}-frame{frame_count}-{timestamp}-{unique_suffix}.jpg"
     local_path = os.path.join(IMAGES_DIR, filename)
-    os.makedirs(IMAGES_DIR, exist_ok=True)
-
     if not cv2.imwrite(local_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85]):
-        LOGGER.error("LOCAL_SAVE_FAILED path=%s", local_path)
+        LOGGER.error("Failed to save frame locally for %s", class_name)
         return None
-
     try:
         s3_client.upload_file(local_path, AWS_BUCKET, filename)
-        LOGGER.info("S3_UPLOAD_SUCCESS bucket=%s key=%s", AWS_BUCKET, filename)
+        LOGGER.info("S3_UPLOAD label=%s key=%s", class_name, filename)
     except Exception as exc:
-        LOGGER.exception("S3_UPLOAD_FAILED bucket=%s key=%s error=%s", AWS_BUCKET, filename, exc)
+        LOGGER.error("S3 upload failed for %s: %s", filename, exc)
         delete_file_safely(local_path)
         return None
-
     return {
         "local_path": local_path,
         "s3_key": filename,
@@ -304,632 +392,261 @@ def persist_frame_to_s3(frame, class_name: str, frame_count: int) -> Optional[Di
 
 def post_to_dashboard(
     payload: Dict[str, Any],
-    track_id: Optional[int] = None,
-    local_path: Optional[str] = None,
+    track_id: Optional[int],
+    local_path: Optional[str],
     retries: int = 3,
 ) -> bool:
-    """Post detection data to the new Robolyze dashboard with retries."""
-    
     headers = {
         "Content-Type": "application/json",
         "X-API-Key": API_KEY,
     }
-    
     for attempt in range(1, retries + 1):
         try:
-            LOGGER.info(
-                "API_POST attempt=%s track_id=%s url=%s payload=%s",
-                attempt,
-                track_id if track_id is not None else "NA",
-                API_URL,
-                payload,
-            )
             response = requests.post(API_URL, headers=headers, json=payload, timeout=6)
-            
-            # Accept both 200 and 201 as success
-            if response.status_code in [200, 201]:
+            if response.status_code in (200, 201):
                 LOGGER.info(
-                    "API_POST_SUCCESS attempt=%s status_code=%s track_id=%s",
+                    "API_POST success attempt=%s track_id=%s status=%s",
                     attempt,
+                    track_id,
                     response.status_code,
-                    track_id if track_id is not None else "NA",
                 )
                 delete_file_safely(local_path)
                 return True
-            else:
-                LOGGER.warning(
-                    "API_POST_UNEXPECTED_STATUS attempt=%s status_code=%s track_id=%s",
-                    attempt,
-                    response.status_code,
-                    track_id if track_id is not None else "NA",
-                )
+            LOGGER.warning(
+                "API_POST unexpected status attempt=%s status=%s track_id=%s",
+                attempt,
+                response.status_code,
+                track_id,
+            )
         except Exception as exc:
             LOGGER.warning(
-                "API_POST_FAILED attempt=%s track_id=%s error=%s",
+                "API_POST attempt=%s failed track_id=%s error=%s",
                 attempt,
-                track_id if track_id is not None else "NA",
+                track_id,
                 exc,
             )
-            time.sleep(2)
-
-    # Save failed upload for later retry
+            time.sleep(1)
     error_file = f"failed_upload_{int(time.time())}.json"
-    try:
-        with open(error_file, "w") as handle:
-            json.dump({"payload": payload, "track_id": track_id}, handle)
-        LOGGER.error("API_POST_GAVE_UP track_id=%s saved=%s", track_id, error_file)
-    except Exception as exc:
-        LOGGER.exception("API_POST_SAVE_FAILED file=%s error=%s", error_file, exc)
+    with open(error_file, "w", encoding="utf-8") as handle:
+        json.dump({"payload": payload, "track_id": track_id}, handle)
+    LOGGER.error("API_POST giving up track_id=%s saved=%s", track_id, error_file)
     return False
 
 
-def build_payload(
-    class_name: str,
-    image_url: str,
-    frame_count: int,
-) -> Dict[str, Any]:
-    """Build payload for new Robolyze dashboard API."""
-    
-    payload = {
-        "did": str(frame_count),
+def build_payload(class_name: str, image_url: str, frame_count: int, track_id: Optional[int]) -> Dict[str, Any]:
+    detection_id = str(track_id) if track_id is not None else str(frame_count)
+    return {
+        "did": detection_id,
         "type": DETECTION_TYPE,
         "detect": class_name,
         "image": image_url,
         "location": LOCATION,
         "company_id": COMPANY_ID,
     }
-    
-    return payload
 
 
 def upload_detection(frame, detection: Dict[str, Any], frame_count: int) -> None:
-    """Upload a single detection to S3 and dashboard."""
-    
-    class_name = detection["class_name"]
+    class_name = detection.get("class_name", "unknown")
     track_id = detection.get("track_id")
     label = normalize_label(class_name)
-    
-    # Check if should upload (prevent duplicates)
     if not upload_manager.should_upload(label, track_id):
         return
-    
-    # If it's a crack, use the batcher (aggregates multiple cracks)
-    if label in CRACK_LABELS:
-        crack_batcher.add_detection(frame, detection, frame_count)
-        return
-    
-    # For non-crack detections, upload immediately
-    # Upload frame to S3
     image_info = persist_frame_to_s3(frame, class_name, frame_count)
     if not image_info:
         return
-
-    # Build payload for new dashboard
-    payload = build_payload(class_name, image_info["url"], frame_count)
-    
-    # Post to dashboard
+    payload = build_payload(class_name, image_info["url"], frame_count, track_id)
     post_to_dashboard(payload, track_id, image_info["local_path"])
 
 
-def schedule_uploads(frame, detections: List[Dict[str, Any]], frame_count: int) -> None:
-    """Schedule uploads in background threads."""
-    
-    for det in detections:
-        # Run upload in separate thread to not block main loop
-        threading.Thread(
-            target=upload_detection,
-            args=(frame.copy(), det, frame_count),
-            daemon=True
-        ).start()
+def submit_upload(
+    executor: ThreadPoolExecutor,
+    frame,
+    detection: Dict[str, Any],
+    frame_count: int,
+    already_copied: bool = False,
+) -> None:
+    if executor is None:
+        upload_detection(frame, detection, frame_count)
+        return
+    payload_frame = frame if already_copied else frame.copy()
+    payload_detection = detection if already_copied else detection.copy()
+    executor.submit(_upload_worker, payload_frame, payload_detection, frame_count)
 
 
-class VideoReader:
-    """
-    Multi-threaded video frame reader.
-    Continuously reads frames in background thread and stores latest frame.
-    """
-    
-    def __init__(self, video_path, resize_percent=65):
-        """
-        Initialize video reader with threading support.
-        
-        Args:
-            video_path: Path to video file
-            resize_percent: Percentage to resize frames (for performance)
-        """
-        self.video_path = video_path
-        self.resize_percent = resize_percent
-        self.cap = cv2.VideoCapture(video_path)
-        
-        if not self.cap.isOpened():
-            LOGGER.error(f"Failed to open video: {video_path}")
-            raise RuntimeError(f"Cannot open video file: {video_path}")
-        
-        # Get video properties
-        self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        LOGGER.info(f"Video loaded: {video_path}")
-        LOGGER.info(f"Properties: {self.width}x{self.height} @ {self.fps}FPS, {self.total_frames} frames")
-        
-        # Threading components
-        self.frame_queue = queue.Queue(maxsize=1)  # Only keep latest frame
-        self.stopped = False
-        self.frame_count = 0
-        
-        # Start reader thread
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
-        LOGGER.info("Video reader thread started")
-    
-    def _reader(self):
-        """Background thread that continuously reads frames."""
-        while not self.stopped:
-            ret, frame = self.cap.read()
-            
-            if not ret:
-                LOGGER.info("End of video reached")
-                self.stopped = True
-                break
-            
-            # Resize frame for performance
-            if self.resize_percent and self.resize_percent != 100:
-                frame = self._resize_frame(frame, self.resize_percent)
-            
-            self.frame_count += 1
-            
-            # Update queue with latest frame (drop old frame if queue is full)
-            try:
-                self.frame_queue.put(frame, timeout=0.1)
-            except queue.Full:
-                # Remove old frame and add new one
-                try:
-                    _ = self.frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                self.frame_queue.put(frame)
-    
-    def _resize_frame(self, frame, percent):
-        """Resize frame by percentage."""
-        width = int(frame.shape[1] * percent / 100)
-        height = int(frame.shape[0] * percent / 100)
-        return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-    
-    def get_frame(self, timeout=1.0):
-        """
-        Get the latest frame from the queue.
-        
-        Args:
-            timeout: Max time to wait for frame (seconds)
-            
-        Returns:
-            Frame or None if timeout/stopped
-        """
-        try:
-            frame = self.frame_queue.get(timeout=timeout)
-            return frame
-        except queue.Empty:
-            if self.stopped:
-                LOGGER.info("Video reader stopped")
-                return None
-            LOGGER.warning(f"Frame retrieval timeout ({timeout}s)")
-            return None
-    
-    def is_alive(self):
-        """Check if reader thread is still running."""
-        return self.thread.is_alive()
-    
-    def is_finished(self):
-        """Check if video has finished."""
-        return self.stopped
-    
-    def stop(self):
-        """Stop the reader thread and release resources."""
-        self.stopped = True
-        self.thread.join(timeout=1.0)
-        self.cap.release()
-        LOGGER.info("Video reader stopped and resources released")
+def _upload_worker(frame, detection: Dict[str, Any], frame_count: int) -> None:
+    try:
+        upload_detection(frame, detection, frame_count)
+    except Exception as exc:
+        LOGGER.exception(
+            "UPLOAD_WORKER_ERROR label=%s track_id=%s error=%s",
+            detection.get("class_name"),
+            detection.get("track_id"),
+            exc,
+        )
 
 
-class PerformanceTracker:
-    """Track and display performance metrics."""
-    
-    def __init__(self):
-        self.start_time = time.time()
-        self.frame_count = 0
-        self.fps_start = time.time()
-        self.fps_frame_count = 0
-        self.current_fps = 0
-        self.detections_count = 0
-        
-        # Metadata storage
-        self.all_detections = []  # List of all detections with metadata
-        self.class_counts = {}  # Count per class
-        
-    def update(self, num_detections=0):
-        """Update metrics with new frame."""
-        self.frame_count += 1
-        self.fps_frame_count += 1
-        self.detections_count += num_detections
-        
-        # Calculate FPS every 20 frames
-        if self.fps_frame_count >= 20:
-            elapsed = time.time() - self.fps_start
-            self.current_fps = self.fps_frame_count / elapsed
-            self.fps_start = time.time()
-            self.fps_frame_count = 0
-    
-    def add_detection(self, frame_number, class_name, confidence, bbox, track_id=None):
-        """Add a detection to metadata."""
-        detection_timestamp = datetime.fromtimestamp(time.time()).strftime('%H:%M:%S')
-        
-        detection = {
-            "frame": frame_number,
-            "timestamp": detection_timestamp,
-            "class": class_name,
-            "confidence": round(float(confidence), 4),
-            "bbox": {
-                "x1": int(bbox[0]),
-                "y1": int(bbox[1]),
-                "x2": int(bbox[2]),
-                "y2": int(bbox[3])
-            }
-        }
-        
-        if track_id is not None:
-            detection["track_id"] = int(track_id)
-        
-        self.all_detections.append(detection)
-        
-        # Update class counts
-        if class_name not in self.class_counts:
-            self.class_counts[class_name] = 0
-        self.class_counts[class_name] += 1
-    
-    def get_stats(self):
-        """Get current performance statistics."""
-        elapsed = time.time() - self.start_time
-        avg_fps = self.frame_count / elapsed if elapsed > 0 else 0
-        
-        return {
-            'current_fps': self.current_fps,
-            'avg_fps': avg_fps,
-            'total_frames': self.frame_count,
-            'total_detections': self.detections_count,
-            'elapsed_time': elapsed
-        }
-    
-    def print_summary(self):
-        """Print final performance summary."""
-        stats = self.get_stats()
-        print("\n" + "="*60)
-        print(Fore.CYAN + "PERFORMANCE SUMMARY")
-        print("="*60)
-        print(f"Total Frames Processed: {stats['total_frames']}")
-        print(f"Total Detections: {stats['total_detections']}")
-        print(f"Average FPS: {stats['avg_fps']:.2f}")
-        print(f"Total Time: {stats['elapsed_time']:.2f}s")
-        
-        if self.class_counts:
-            print("\nDetections by Class:")
-            for class_name, count in sorted(self.class_counts.items()):
-                print(f"  - {class_name}: {count}")
-        
-        print("="*60 + "\n")
-        
-        LOGGER.info(f"Performance Summary - Frames: {stats['total_frames']}, "
-                   f"Detections: {stats['total_detections']}, "
-                   f"Avg FPS: {stats['avg_fps']:.2f}, "
-                   f"Time: {stats['elapsed_time']:.2f}s")
-
-
-def draw_detections(frame, result, names, fps=0):
-    """
-    Draw bounding boxes and labels on frame.
-    
-    Args:
-        frame: Input frame
-        result: YOLO detection result
-        names: Class names dictionary
-        fps: Current FPS for display
-        
-    Returns:
-        Annotated frame
-    """
-    img = frame.copy()
-    boxes = result.boxes
-    
-    # Draw FPS counter
-    fps_text = f"FPS: {fps:.1f}"
-    cv2.putText(img, fps_text, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-    
-    if boxes is None or boxes.xyxy is None:
-        return img
-    
+def extract_detections(result, names: Dict[int, str]) -> List[Dict[str, Any]]:
+    detections: List[Dict[str, Any]] = []
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or boxes.cls is None:
+        return detections
     xyxy_list = boxes.xyxy
     cls_list = boxes.cls
     conf_list = getattr(boxes, "conf", None)
-    
-    # Draw each detection
-    for i in range(len(cls_list)):
-        x1, y1, x2, y2 = [int(float(v)) for v in xyxy_list[i]]
-        cls_id = int(cls_list[i])
-        label = names[cls_id]
-        
-        # Add confidence to label
-        if conf_list is not None:
-            conf = float(conf_list[i])
-            label = f"{label} {conf:.2f}"
-        
-        # Draw bounding box
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        
-        # Draw label background
-        (text_width, text_height), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        text_height_total = text_height + baseline + 4
-        y_text = max(y1, text_height_total + 2)
-        
-        cv2.rectangle(img, 
-                     (x1, y_text - text_height_total), 
-                     (x1 + text_width + 6, y_text), 
-                     (0, 255, 0), -1)
-        
-        # Draw label text
-        cv2.putText(img, label, 
-                   (x1 + 3, y_text - baseline - 2),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-    
-    return img
+    track_list = getattr(boxes, "id", None)
+    for idx in range(len(cls_list)):
+        class_id = int(cls_list[idx])
+        class_name = names.get(class_id, str(class_id))
+        detection = {
+            "class_name": class_name,
+            "confidence": float(conf_list[idx]) if conf_list is not None else 0.0,
+            "bbox": [float(v) for v in xyxy_list[idx]],
+        }
+        if track_list is not None and idx < len(track_list) and track_list[idx] is not None:
+            detection["track_id"] = int(track_list[idx])
+        detections.append(detection)
+    return detections
 
 
-def save_metadata_json(perf, video_path, model_path, output_path):
-    """Save all detection metadata to JSON file."""
-    stats = perf.get_stats()
-    
-    metadata = {
-        "test_info": {
-            "video_path": video_path,
-            "model_path": model_path,
-            "test_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            "device": DEVICE,
-            "resize_percent": RESIZE_PERCENT,
-            "confidence_threshold": CONFIDENCE_THRESHOLD,
-            "iou_threshold": IOU_THRESHOLD
-        },
-        "performance": {
-            "total_frames": stats['total_frames'],
-            "total_detections": stats['total_detections'],
-            "average_fps": round(stats['avg_fps'], 2),
-            "processing_time_seconds": round(stats['elapsed_time'], 2)
-        },
-        "class_summary": perf.class_counts,
-        "detections": perf.all_detections
-    }
-    
-    with open(output_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    LOGGER.info(f"Metadata saved to {output_path}")
-    print(Fore.GREEN + f"✓ Metadata saved to {output_path}")
-    
-    # Also save a summary without individual detections for quick viewing
-    summary_path = output_path.replace('.json', '_summary.json')
-    summary = {
-        "test_info": metadata["test_info"],
-        "performance": metadata["performance"],
-        "class_summary": metadata["class_summary"]
-    }
-    
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    print(Fore.GREEN + f"✓ Summary saved to {summary_path}")
+def draw_detection(frame, detection: Dict[str, Any]) -> None:
+    bbox = detection.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return
+    x1, y1, x2, y2 = [int(b) for b in bbox]
+    x1 = max(0, min(frame.shape[1] - 1, x1))
+    y1 = max(0, min(frame.shape[0] - 1, y1))
+    x2 = max(0, min(frame.shape[1] - 1, x2))
+    y2 = max(0, min(frame.shape[0] - 1, y2))
+    color = (0, 255, 0)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    class_name = detection.get("class_name", "object")
+    confidence = detection.get("confidence")
+    track_id = detection.get("track_id")
+    label_text = class_name
+    if confidence is not None:
+        label_text += f" {confidence:.2f}"
+    if track_id is not None:
+        label_text += f" #{track_id}"
+    (text_w, text_h), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    top_left = (x1, max(y1 - text_h - baseline - 4, 0))
+    bottom_right = (x1 + text_w + 6, top_left[1] + text_h + baseline + 4)
+    cv2.rectangle(frame, top_left, bottom_right, color, -1)
+    cv2.putText(
+        frame,
+        label_text,
+        (top_left[0] + 3, top_left[1] + text_h),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 0),
+        2,
+        cv2.LINE_AA,
+    )
 
 
-def main():
-    """Main testing loop with multi-threading."""
-    
-    print(Fore.CYAN + "\n" + "="*60)
-    print(Fore.CYAN + "YOLO MODEL PERFORMANCE TESTER (Multi-threaded)")
-    print(Fore.CYAN + "="*60 + "\n")
-    
-    LOGGER.info("="*60)
-    LOGGER.info("Starting YOLO model performance test")
-    LOGGER.info("="*60)
-    
-    video_reader = None
-    video_writer = None
-    show_window = SHOW_WINDOW  # Local copy to modify if GUI fails
-    
+def run_inference():
+    print(Fore.CYAN + "Starting edge inference pipeline\n")
+    LOGGER.info("Starting edge inference pipeline")
+
+    camera = CameraStream(CAMERA_SOURCE, CAMERA_WIDTH_VALUE, CAMERA_HEIGHT_VALUE, RECONNECT_DELAY)
+    model = YOLO(MODEL_PATH)
     try:
-        # Initialize video reader (multi-threaded)
-        print(Fore.YELLOW + f"Loading video: {VIDEO_PATH}")
-        video_reader = VideoReader(VIDEO_PATH, resize_percent=RESIZE_PERCENT)
-        
-        if not video_reader.is_alive():
-            raise RuntimeError("Video reader thread failed to start")
-        
-        print(Fore.GREEN + "✓ Video reader initialized")
-        print(Fore.YELLOW + f"Loading model: {MODEL_PATH}")
-        
-        # Load YOLO model
-        model = YOLO(MODEL_PATH)
-        
-        # Move model to GPU if available
-        try:
-            model.to(DEVICE)
-            print(Fore.GREEN + f"✓ Model loaded on {DEVICE}: {', '.join(model.names.values())}")
-        except Exception as e:
-            print(Fore.YELLOW + f"Warning: Could not move model to {DEVICE} ({e})")
-            print(Fore.GREEN + f"✓ Model loaded: {', '.join(model.names.values())}")
-        
-        LOGGER.info(f"Model loaded with classes: {', '.join(model.names.values())}")
-        LOGGER.info(f"Using device: {DEVICE}")
-        
-        # Setup video writer if saving output
-        if SAVE_OUTPUT_VIDEO:
-            output_path = os.path.join(RESULTS_DIR, f"output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            fps = video_reader.fps if video_reader.fps > 0 else 30
-            frame_size = (int(video_reader.width * RESIZE_PERCENT / 100), 
-                         int(video_reader.height * RESIZE_PERCENT / 100))
-            video_writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
-            print(Fore.GREEN + f"✓ Output video will be saved to: {output_path}")
-            LOGGER.info(f"Output video path: {output_path}")
-        
-        # Initialize performance tracker
-        perf = PerformanceTracker()
-        
-        if show_window:
-            print(Fore.CYAN + "\nStarting inference... Press 'q' to quit\n")
-        else:
-            print(Fore.CYAN + "\nStarting inference (headless mode)...\n")
-        LOGGER.info("Entering main detection loop")
-        
-        # Main detection loop
+        model.to(DEVICE)
+        LOGGER.info("Model loaded on %s", DEVICE)
+    except Exception as exc:
+        LOGGER.warning("Unable to move model to %s: %s", DEVICE, exc)
+
+    executor = ThreadPoolExecutor(max_workers=max(2, UPLOAD_WORKERS))
+    perf = PerformanceMonitor(PERF_LOG_INTERVAL)
+    crack_batcher = CrackBatcher(
+        CRACK_UPLOAD_DELAY,
+        lambda frame, detection, frame_idx, copied: submit_upload(
+            executor, frame, detection, frame_idx, already_copied=copied
+        ),
+    )
+    show_window = SHOW_WINDOW
+    window_name = "Edge Detection"
+
+    try:
         while True:
-            # Get frame from threaded reader
-            frame = video_reader.get_frame(timeout=1.0)
-            
+            frame = camera.read()
             if frame is None:
-                if video_reader.is_finished():
-                    print(Fore.YELLOW + "\nVideo finished")
-                    LOGGER.info("Video playback completed")
+                if camera.is_finished():
+                    LOGGER.info("Input stream finished")
                     break
-                else:
-                    print(Fore.RED + "Failed to get frame")
+                LOGGER.warning("No frame retrieved from camera. Retrying...")
+                continue
+
+            frame_index = perf.next_frame_index()
+            try:
+                results = model.track(
+                    frame,
+                    persist=True,
+                    conf=CONFIDENCE_THRESHOLD,
+                    iou=IOU_THRESHOLD,
+                    device=DEVICE,
+                    verbose=False,
+                )
+            except Exception as exc:
+                LOGGER.exception("Model inference failed: %s", exc)
+                time.sleep(0.05)
+                continue
+
+            detections = extract_detections(results[0], model.names)
+            relevant_count = 0
+            frame_for_uploads = None
+
+            for detection in detections:
+                label = normalize_label(detection.get("class_name"))
+                if label not in INTERESTING_LABELS:
                     continue
-            
-            # Run inference with explicit device
-            results = model.track(frame, persist=True, 
-                                conf=CONFIDENCE_THRESHOLD, 
-                                iou=IOU_THRESHOLD,
-                                device=DEVICE,
-                                verbose=False)
-            
-            # Count detections and store metadata
-            num_detections = 0
-            upload_candidates: List[Dict[str, Any]] = []
-            if results[0].boxes is not None and results[0].boxes.cls is not None:
-                boxes = results[0].boxes
-                num_detections = len(boxes.cls)
-                xyxy_list = boxes.xyxy
-                cls_list = boxes.cls
-                conf_list = getattr(boxes, "conf", None)
-                track_list = getattr(boxes, "id", None)
+                if frame_for_uploads is None:
+                    frame_for_uploads = frame.copy()
+                draw_detection(frame_for_uploads, detection)
+                relevant_count += 1
+                confidence = detection.get("confidence", 0.0)
+                LOGGER.info(
+                    "DETECTION frame=%s label=%s conf=%.2f track_id=%s",
+                    frame_index,
+                    label,
+                    confidence,
+                    detection.get("track_id"),
+                )
+                if label in CRACK_LABELS:
+                    crack_batcher.add_detection(frame_for_uploads, detection, frame_index)
+                else:
+                    submit_upload(executor, frame_for_uploads, detection, frame_index)
 
-                for i in range(num_detections):
-                    class_id = int(cls_list[i])
-                    class_name = model.names[class_id]
-                    confidence = float(conf_list[i]) if conf_list is not None else 0.0
-                    bbox = [float(v) for v in xyxy_list[i]]
-                    track_id = int(track_list[i]) if track_list is not None and i < len(track_list) else None
+            perf.update(relevant_count)
 
-                    upload_candidates.append(
-                        {
-                            "class_name": class_name,
-                            "confidence": confidence,
-                            "track_id": track_id,
-                            "bbox": bbox,
-                        }
-                    )
-
-                    # Store detection metadata if enabled
-                    if SAVE_METADATA:
-                        perf.add_detection(
-                            frame_number=perf.frame_count,
-                            class_name=class_name,
-                            confidence=confidence,
-                            bbox=bbox,
-                            track_id=track_id
-                        )
-            
-            # Update performance metrics
-            perf.update(num_detections)
-            stats = perf.get_stats()
-            
-            # Draw detections
-            annotated_frame = draw_detections(frame, results[0], model.names, 
-                                             fps=stats['current_fps'])
-
-            # Schedule uploads to new dashboard
-            if upload_candidates:
-                schedule_uploads(annotated_frame, upload_candidates, perf.frame_count)
-            
-            # Save to output video if enabled
-            if SAVE_OUTPUT_VIDEO and video_writer is not None:
-                video_writer.write(annotated_frame)
-            
-            # Display progress
-            progress = (perf.frame_count / video_reader.total_frames) * 100
-            print(f"\rFrame {perf.frame_count}/{video_reader.total_frames} "
-                  f"({progress:.1f}%) | FPS: {stats['current_fps']:.1f} | "
-                  f"Detections: {num_detections}", end='')
-            
-            # Show frame (with error handling for headless environments)
+            frame_to_show = frame_for_uploads if frame_for_uploads is not None else frame
             if show_window:
                 try:
-                    cv2.imshow("YOLO Model Testing", annotated_frame)
-                    
-                    # Check for quit
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        print(Fore.YELLOW + "\n\nUser requested exit")
-                        LOGGER.info("User interrupted testing (q pressed)")
+                    cv2.imshow(window_name, frame_to_show)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        LOGGER.info("Exit requested by user (q)")
                         break
-                except cv2.error as e:
-                    # OpenCV GUI not available (headless environment)
-                    print(Fore.YELLOW + f"\n\nWarning: Display not available ({str(e)[:50]}...)")
-                    print(Fore.YELLOW + "Continuing in headless mode (no video display)\n")
-                    LOGGER.warning("OpenCV GUI not available; continuing without display")
-                    show_window = False  # Disable further display attempts
+                except cv2.error as exc:
+                    LOGGER.warning("OpenCV display unavailable: %s", exc)
+                    show_window = False
                     try:
                         cv2.destroyAllWindows()
-                    except:
+                    except cv2.error:
                         pass
-        
-        # Print final results
-        perf.print_summary()
-        
-        # Save metadata JSON if enabled
-        if SAVE_METADATA:
-            metadata_file = os.path.join(RESULTS_DIR, 
-                                        f"metadata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-            save_metadata_json(perf, VIDEO_PATH, MODEL_PATH, metadata_file)
-        
-        print(Fore.GREEN + f"✓ Testing complete!")
-        
+
     except KeyboardInterrupt:
-        print(Fore.YELLOW + "\n\nInterrupted by user (Ctrl+C)")
-        LOGGER.info("Testing interrupted by user (KeyboardInterrupt)")
-    
-    except Exception as e:
-        print(Fore.RED + f"\nError: {e}")
-        LOGGER.exception(f"Unexpected error: {e}")
-    
+        LOGGER.info("Interrupted by user")
     finally:
-        # Cleanup
-        if video_reader is not None:
-            video_reader.stop()
-        if video_writer is not None:
-            video_writer.release()
-            print(Fore.GREEN + f"\n✓ Output video saved")
+        crack_batcher.shutdown()
+        executor.shutdown(wait=True)
+        camera.release()
         if show_window:
             try:
                 cv2.destroyAllWindows()
-            except:
+            except cv2.error:
                 pass
-        
-        # Shutdown crack batcher and flush remaining cracks
-        crack_batcher.shutdown()
-        LOGGER.info("Crack batcher shut down")
-        
-        print(Fore.GREEN + "\n✓ Resources released")
-        LOGGER.info("Testing session ended")
+        print(Fore.GREEN + "\nEdge inference pipeline stopped\n")
+        LOGGER.info("Shutdown complete")
 
 
 if __name__ == "__main__":
-    main()
+    run_inference()
