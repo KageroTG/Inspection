@@ -36,7 +36,7 @@ CAMERA_SOURCE_RAW = os.getenv("CAMERA_SOURCE", "Ipoh to KL - 15minutes.mp4")
 CAMERA_WIDTH = os.getenv("CAMERA_WIDTH")
 CAMERA_HEIGHT = os.getenv("CAMERA_HEIGHT")
 RECONNECT_DELAY = float(os.getenv("CAMERA_RECONNECT_DELAY", "1.5"))
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.35"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.4"))
 UPLOAD_WORKERS = max(1, int(os.getenv("UPLOAD_WORKERS", "4")))
 CRACK_UPLOAD_DELAY = float(os.getenv("CRACK_UPLOAD_DELAY", "5.0"))
@@ -57,7 +57,7 @@ def _parse_label_set(raw: Optional[str], fallback: List[str]) -> set:
 
 IMMEDIATE_UPLOAD_LABELS = _parse_label_set(
     os.getenv("PRIORITY_CLASSES"),
-    ["pothole", "potholes", "raveling"],
+    ["pothole", "potholes", "raveling", "stagnant_water"],
 )
 CRACK_LABELS = _parse_label_set(
     os.getenv("CRACK_CLASSES"),
@@ -176,21 +176,20 @@ CAMERA_HEIGHT_VALUE = _parse_int(CAMERA_HEIGHT)
 
 
 class UploadManager:
-    """Prevent duplicate uploads for the same label/track pair."""
+    """Prevent duplicate uploads for the same tracked object."""
 
     def __init__(self) -> None:
         self._seen = set()
         self._lock = threading.Lock()
 
-    def should_upload(self, label: str, track_id: Optional[int]) -> bool:
+    def should_upload(self, track_id: Optional[int]) -> bool:
         if track_id is None:
-            return True
-        key = (label, int(track_id))
+            return False
         with self._lock:
-            if key in self._seen:
-                LOGGER.debug("Duplicate suppressed label=%s track_id=%s", label, track_id)
+            if track_id in self._seen:
+                LOGGER.debug("Duplicate suppressed track_id=%s", track_id)
                 return False
-            self._seen.add(key)
+            self._seen.add(track_id)
             return True
 
 
@@ -448,8 +447,7 @@ def build_payload(class_name: str, image_url: str, frame_count: int, track_id: O
 def upload_detection(frame, detection: Dict[str, Any], frame_count: int) -> None:
     class_name = detection.get("class_name", "unknown")
     track_id = detection.get("track_id")
-    label = normalize_label(class_name)
-    if not upload_manager.should_upload(label, track_id):
+    if not upload_manager.should_upload(track_id):
         return
     image_info = persist_frame_to_s3(frame, class_name, frame_count)
     if not image_info:
@@ -518,7 +516,7 @@ def draw_detection(frame, detection: Dict[str, Any]) -> None:
     x2 = max(0, min(frame.shape[1] - 1, x2))
     y2 = max(0, min(frame.shape[0] - 1, y2))
     color = (0, 255, 0)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
     class_name = detection.get("class_name", "object")
     confidence = detection.get("confidence")
     track_id = detection.get("track_id")
@@ -599,6 +597,14 @@ def run_inference():
                 label = normalize_label(detection.get("class_name"))
                 if label not in INTERESTING_LABELS:
                     continue
+                track_id = detection.get("track_id")
+                if track_id is None:
+                    LOGGER.debug(
+                        "Skipping %s on frame %s because track id unavailable",
+                        label,
+                        frame_index,
+                    )
+                    continue
                 if frame_for_uploads is None:
                     frame_for_uploads = frame.copy()
                 draw_detection(frame_for_uploads, detection)
@@ -609,7 +615,7 @@ def run_inference():
                     frame_index,
                     label,
                     confidence,
-                    detection.get("track_id"),
+                    track_id,
                 )
                 if label in CRACK_LABELS:
                     crack_batcher.add_detection(frame_for_uploads, detection, frame_index)
