@@ -1,20 +1,48 @@
 import os
-import sys
 import time
 import threading
-import logging
 import json
 import random
 from datetime import timezone, timedelta, datetime
 from typing import Optional, Dict, Any, List, Callable
 from concurrent.futures import ThreadPoolExecutor
 
-from dotenv import load_dotenv
 import cv2
 import boto3
 import requests
 from ultralytics import YOLO
 from colorama import init, Fore
+
+from config.settings import (
+    API_KEY,
+    API_URL,
+    AWS_ACCESS_KEY,
+    AWS_BASE_URL,
+    AWS_BUCKET,
+    AWS_REGION,
+    AWS_SECRET_KEY,
+    CAMERA_HEIGHT_VALUE,
+    CAMERA_SOURCE,
+    CAMERA_WIDTH_VALUE,
+    CONFIDENCE_THRESHOLD,
+    CRACK_LABELS,
+    CRACK_UPLOAD_DELAY,
+    DETECTION_TYPE,
+    IMAGES_DIR,
+    INTERESTING_LABELS,
+    IOU_THRESHOLD,
+    LOCATION,
+    LOG_DIR,
+    MODEL_PATH,
+    PERF_LOG_INTERVAL,
+    RECONNECT_DELAY,
+    SHOW_WINDOW,
+    UPLOAD_WORKERS,
+    USE_GPU,
+)
+from utils.directories import ensure_directories
+from utils.logger import setup_logging
+from utils.validators import validate_environment
 
 try:
     import torch
@@ -22,65 +50,9 @@ except ImportError:  # pragma: no cover - torch may be missing on some deploymen
     torch = None
 
 
-load_dotenv()
 init(autoreset=True)
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-LOG_DIR = "logs"
-IMAGES_DIR = "images"
-MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
-CAMERA_SOURCE_RAW = os.getenv("CAMERA_SOURCE", "Ipoh to KL - 15minutes.mp4")
-CAMERA_WIDTH = os.getenv("CAMERA_WIDTH")
-CAMERA_HEIGHT = os.getenv("CAMERA_HEIGHT")
-RECONNECT_DELAY = float(os.getenv("CAMERA_RECONNECT_DELAY", "1.5"))
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
-IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.4"))
-UPLOAD_WORKERS = max(1, int(os.getenv("UPLOAD_WORKERS", "4")))
-CRACK_UPLOAD_DELAY = float(os.getenv("CRACK_UPLOAD_DELAY", "5.0"))
-PERF_LOG_INTERVAL = float(os.getenv("PERF_LOG_INTERVAL", "5.0"))
-SHOW_WINDOW = os.getenv("SHOW_WINDOW", "1") == "1"
-
-# Detection configuration
-COMPANY_ID = os.getenv("ROBOCOMPANY_ID", "1005")
-LOCATION = os.getenv("ROBOLOCATION", "1111110000.1551331")
-DETECTION_TYPE = os.getenv("ROBODETECTION_TYPE", "RoAd")
-
-
-def _parse_label_set(raw: Optional[str], fallback: List[str]) -> set:
-    if not raw:
-        return {item.strip().lower() for item in fallback if item.strip()}
-    return {item.strip().lower() for item in raw.split(",") if item.strip()}
-
-
-IMMEDIATE_UPLOAD_LABELS = _parse_label_set(
-    os.getenv("PRIORITY_CLASSES"),
-    ["pothole", "potholes", "raveling", "stagnant_water"],
-)
-CRACK_LABELS = _parse_label_set(
-    os.getenv("CRACK_CLASSES"),
-    ["crack", "cracks"],
-)
-INTERESTING_LABELS = IMMEDIATE_UPLOAD_LABELS | CRACK_LABELS
-
-
-# API / AWS configuration
-API_URL = os.getenv("ROBOLYZE_API_URL")
-API_KEY = os.getenv("ROBOLYZE_API_KEY")
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_BUCKET = os.getenv("AWS_BUCKET", "robolyzedatamy")
-AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-5")
-AWS_BASE_URL = os.getenv(
-    "AWS_BASE_URL",
-    f"https://{AWS_BUCKET}.s3.{AWS_REGION}.amazonaws.com",
-)
-
-
-# GPU configuration
-USE_GPU = os.getenv("USE_GPU", "1") == "1"
 DEVICE: Optional[str]
 if USE_GPU and torch is not None:
     if torch.cuda.is_available():
@@ -106,30 +78,14 @@ print(Fore.CYAN + f"Device set to: {DEVICE}\n")
 # ---------------------------------------------------------------------------
 # Logging setup and directory creation
 # ---------------------------------------------------------------------------
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(IMAGES_DIR, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(LOG_DIR, f"edge_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-LOGGER = logging.getLogger("edge_inference")
+ensure_directories(LOG_DIR, IMAGES_DIR)
+LOGGER = setup_logging(LOG_DIR)
 
 
 # ---------------------------------------------------------------------------
 # Environment validation
 # ---------------------------------------------------------------------------
-if not API_URL or not API_KEY:
-    LOGGER.error("Missing ROBOLYZE_API_URL or ROBOLYZE_API_KEY in environment")
-    sys.exit(1)
-
-if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
-    LOGGER.error("Missing AWS credentials in environment")
-    sys.exit(1)
+validate_environment(API_URL, API_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, LOGGER)
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +101,7 @@ try:
     LOGGER.info("✓ S3 client ready for bucket %s", AWS_BUCKET)
 except Exception as exc:
     LOGGER.error("Failed to create S3 client: %s", exc)
-    sys.exit(1)
+    raise SystemExit(1)
 
 MYT = timezone(timedelta(hours=8))
 
@@ -153,26 +109,6 @@ MYT = timezone(timedelta(hours=8))
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
-
-def _parse_camera_source(raw: str):
-    try:
-        return int(raw)
-    except ValueError:
-        return raw
-
-
-def _parse_int(value: Optional[str]) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
-CAMERA_SOURCE = _parse_camera_source(CAMERA_SOURCE_RAW)
-CAMERA_WIDTH_VALUE = _parse_int(CAMERA_WIDTH)
-CAMERA_HEIGHT_VALUE = _parse_int(CAMERA_HEIGHT)
 
 
 class UploadManager:
@@ -199,7 +135,13 @@ upload_manager = UploadManager()
 class CameraStream:
     """Thin wrapper around cv2.VideoCapture that supports files and live cameras."""
 
-    def __init__(self, source, width: Optional[int], height: Optional[int], reconnect_delay: float):
+    def __init__(
+        self,
+        source,
+        width: Optional[int],
+        height: Optional[int],
+        reconnect_delay: float,
+    ):
         self.source = source
         self.width = width
         self.height = height
@@ -239,7 +181,9 @@ class CameraStream:
             LOGGER.info("Video source %s finished", self.source)
             self._finished = True
             return None
-        LOGGER.warning("Camera frame missing. Reconnecting in %.1fs", self.reconnect_delay)
+        LOGGER.warning(
+            "Camera frame missing. Reconnecting in %.1fs", self.reconnect_delay
+        )
         time.sleep(self.reconnect_delay)
         try:
             self._open()
@@ -295,7 +239,11 @@ class PerformanceMonitor:
 class CrackBatcher:
     """Hold latest crack detection for a short delay before uploading."""
 
-    def __init__(self, delay_seconds: float, upload_callback: Callable[[Any, Dict[str, Any], int, bool], None]):
+    def __init__(
+        self,
+        delay_seconds: float,
+        upload_callback: Callable[[Any, Dict[str, Any], int, bool], None],
+    ):
         self.delay_seconds = delay_seconds
         self._upload_callback = upload_callback
         self._lock = threading.Lock()
@@ -366,7 +314,9 @@ def delete_file_safely(path: Optional[str]) -> None:
         LOGGER.warning("Failed to delete %s: %s", path, exc)
 
 
-def persist_frame_to_s3(frame, class_name: str, frame_count: int) -> Optional[Dict[str, str]]:
+def persist_frame_to_s3(
+    frame, class_name: str, frame_count: int
+) -> Optional[Dict[str, str]]:
     now = datetime.now(MYT)
     timestamp = now.strftime("%Y%m%d_%H%M%S")
     unique_suffix = f"{now.microsecond}_{random.randint(1000, 9999)}"
@@ -432,7 +382,9 @@ def post_to_dashboard(
     return False
 
 
-def build_payload(class_name: str, image_url: str, frame_count: int, track_id: Optional[int]) -> Dict[str, Any]:
+def build_payload(
+    class_name: str, image_url: str, frame_count: int, track_id: Optional[int]
+) -> Dict[str, Any]:
     detection_id = str(track_id) if track_id is not None else str(frame_count)
     return {
         "did": detection_id,
@@ -440,7 +392,6 @@ def build_payload(class_name: str, image_url: str, frame_count: int, track_id: O
         "detect": class_name,
         "image": image_url,
         "location": LOCATION,
-        "company_id": COMPANY_ID,
     }
 
 
@@ -500,7 +451,11 @@ def extract_detections(result, names: Dict[int, str]) -> List[Dict[str, Any]]:
             "confidence": float(conf_list[idx]) if conf_list is not None else 0.0,
             "bbox": [float(v) for v in xyxy_list[idx]],
         }
-        if track_list is not None and idx < len(track_list) and track_list[idx] is not None:
+        if (
+            track_list is not None
+            and idx < len(track_list)
+            and track_list[idx] is not None
+        ):
             detection["track_id"] = int(track_list[idx])
         detections.append(detection)
     return detections
@@ -516,7 +471,7 @@ def draw_detection(frame, detection: Dict[str, Any]) -> None:
     x2 = max(0, min(frame.shape[1] - 1, x2))
     y2 = max(0, min(frame.shape[0] - 1, y2))
     color = (0, 255, 0)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     class_name = detection.get("class_name", "object")
     confidence = detection.get("confidence")
     track_id = detection.get("track_id")
@@ -525,7 +480,9 @@ def draw_detection(frame, detection: Dict[str, Any]) -> None:
         label_text += f" {confidence:.2f}"
     if track_id is not None:
         label_text += f" #{track_id}"
-    (text_w, text_h), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    (text_w, text_h), baseline = cv2.getTextSize(
+        label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+    )
     top_left = (x1, max(y1 - text_h - baseline - 4, 0))
     bottom_right = (x1 + text_w + 6, top_left[1] + text_h + baseline + 4)
     cv2.rectangle(frame, top_left, bottom_right, color, -1)
@@ -545,7 +502,9 @@ def run_inference():
     print(Fore.CYAN + "Starting edge inference pipeline\n")
     LOGGER.info("Starting edge inference pipeline")
 
-    camera = CameraStream(CAMERA_SOURCE, CAMERA_WIDTH_VALUE, CAMERA_HEIGHT_VALUE, RECONNECT_DELAY)
+    camera = CameraStream(
+        CAMERA_SOURCE, CAMERA_WIDTH_VALUE, CAMERA_HEIGHT_VALUE, RECONNECT_DELAY
+    )
     model = YOLO(MODEL_PATH)
     try:
         model.to(DEVICE)
@@ -597,14 +556,6 @@ def run_inference():
                 label = normalize_label(detection.get("class_name"))
                 if label not in INTERESTING_LABELS:
                     continue
-                track_id = detection.get("track_id")
-                if track_id is None:
-                    LOGGER.debug(
-                        "Skipping %s on frame %s because track id unavailable",
-                        label,
-                        frame_index,
-                    )
-                    continue
                 if frame_for_uploads is None:
                     frame_for_uploads = frame.copy()
                 draw_detection(frame_for_uploads, detection)
@@ -615,16 +566,20 @@ def run_inference():
                     frame_index,
                     label,
                     confidence,
-                    track_id,
+                    detection.get("track_id"),
                 )
                 if label in CRACK_LABELS:
-                    crack_batcher.add_detection(frame_for_uploads, detection, frame_index)
+                    crack_batcher.add_detection(
+                        frame_for_uploads, detection, frame_index
+                    )
                 else:
                     submit_upload(executor, frame_for_uploads, detection, frame_index)
 
             perf.update(relevant_count)
 
-            frame_to_show = frame_for_uploads if frame_for_uploads is not None else frame
+            frame_to_show = (
+                frame_for_uploads if frame_for_uploads is not None else frame
+            )
             if show_window:
                 try:
                     cv2.imshow(window_name, frame_to_show)

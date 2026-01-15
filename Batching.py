@@ -5,10 +5,12 @@ import time
 # ================================================================
 # CONFIGURATION
 # ================================================================
-METADATA_PATH = r"D:\NIK WORK\ROBOMY\PROJECTS\MultiThreading\results\metadata_20251209_125621.json"
+METADATA_PATH = (
+    r"D:\NIK WORK\ROBOMY\PROJECTS\MultiThreading\results\metadata_20251209_125621.json"
+)
 TIME_WINDOW = 20  # seconds per batch
 CRACK_CLASS = "cracks"
-CONF_THRESHOLD = 0.5  
+CONF_THRESHOLD = 0.5
 OUTPUT_HTML = "batched_output3test.html"
 
 
@@ -171,25 +173,27 @@ th {
 
     for idx, (start_time, detections) in enumerate(batches, 1):
         end_time = start_time + TIME_WINDOW
-        
+
         # Convert Unix timestamps back to HH:MM:SS for display
         start_time_str = datetime.fromtimestamp(start_time).strftime("%H:%M:%S")
         end_time_str = datetime.fromtimestamp(end_time).strftime("%H:%M:%S")
-        
+
         # Get the start and end seconds for display
         start_sec = int(start_time) % 60
         end_sec = int(end_time) % 60
-        
+
         html += f"""
 <div class="batch-container">
   <div class="batch-header">Batch {idx} — Time Window: {start_time_str} → {end_time_str}</div>
 """
-        
+
         # Separate detections by class
         pothole_dets = [d for d in detections if d["class"].lower() == "potholes"]
         raveling_dets = [d for d in detections if d["class"].lower() == "raveling"]
-        crack_dets = [d for d in detections if d["class"].lower() == CRACK_CLASS.lower()]
-        
+        crack_dets = [
+            d for d in detections if d["class"].lower() == CRACK_CLASS.lower()
+        ]
+
         # Display potholes directly (not collapsible)
         if pothole_dets:
             html += f"""
@@ -212,7 +216,7 @@ th {
       </tr>
 """
             html += "    </table></div>"
-        
+
         # Display raveling directly (not collapsible)
         if raveling_dets:
             html += f"""
@@ -235,7 +239,7 @@ th {
       </tr>
 """
             html += "    </table></div>"
-        
+
         # Display cracks in collapsible format
         if crack_dets:
             html += f"""
@@ -259,7 +263,7 @@ th {
         </tr>
 """
             html += "      </table></details></div>"
-        
+
         html += "</div>"
 
     html += "</body></html>"
@@ -308,10 +312,12 @@ def main():
     )
 
     # Count detections by class
-    crack_count = sum(1 for d in detections if d["class"].lower() == CRACK_CLASS.lower())
+    crack_count = sum(
+        1 for d in detections if d["class"].lower() == CRACK_CLASS.lower()
+    )
     pothole_count = sum(1 for d in detections if d["class"].lower() == "potholes")
     raveling_count = sum(1 for d in detections if d["class"].lower() == "raveling")
-    
+
     print(f"[+] Cracks detected: {crack_count}")
     print(f"[+] Potholes detected: {pothole_count}")
     print(f"[+] Raveling detected: {raveling_count}")

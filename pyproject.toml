@@ -1,0 +1,21 @@
+[project]
+name = "inspection"
+version = "0.0.0"
+description = "Inspection bootstrap and utilities (WIP refactor)."
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7.4",
+]
+tooling = [
+  "black>=24.4",
+  "flake8>=7.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-vv -ra"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
