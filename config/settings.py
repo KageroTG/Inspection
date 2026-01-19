@@ -12,7 +12,7 @@ load_dotenv()
 LOG_DIR = "logs"
 IMAGES_DIR = "images"
 
-MODEL_PATH = os.getenv("MODEL_PATH", "best 8.1_v26_150epoch.pt")
+MODEL_PATH = os.getenv("MODEL_PATH", "best_8n_8.2.pt")
 CAMERA_SOURCE_RAW = os.getenv("CAMERA_SOURCE", "Ipoh to KL - 15minutes.mp4")
 CAMERA_WIDTH = os.getenv("CAMERA_WIDTH")
 CAMERA_HEIGHT = os.getenv("CAMERA_HEIGHT")
