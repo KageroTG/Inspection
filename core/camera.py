@@ -104,6 +104,14 @@ class CameraManager:
     def read(self):
         return self.read_frame()
 
+    def get_fps(self) -> Optional[float]:
+        if self.cap is None:
+            return None
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if fps and fps > 0:
+            return float(fps)
+        return None
+
     def release(self) -> None:
         if self.cap:
             self.cap.release()

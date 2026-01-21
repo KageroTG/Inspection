@@ -7,7 +7,7 @@ This repo is being migrated to a modular structure. For now it includes a minima
 `main.py` performs a lightweight startup sequence and runs the camera + detection loop:
 
 - Loads environment variables from `.env` if present.
-- Ensures runtime directories exist (`logs/`, `images/`).
+- Ensures runtime directories exist (`logs/`, `images/`, `videos/`).
 - Configures logging to both console and a timestamped log file.
 - Optionally validates required environment variables when `STRICT_ENV_VALIDATION=1`.
 - Opens the configured camera source and (optionally) shows frames when `SHOW_WINDOW=1`.
@@ -58,6 +58,13 @@ STRICT_ENV_VALIDATION=1 python main.py
 
 - Centralizes runtime flags and environment-derived settings.
 - Calls `load_dotenv()` so `.env` values are available across modules.
+
+### Recording settings
+
+Set these in `.env`:
+
+- `RECORD=1` to enable recording (default off).
+- `RECORD_ALL_FRAMES=1` to record every frame (set `0` to record only frames with detections).
 
 ## Core
 

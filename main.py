@@ -1,6 +1,8 @@
 """Entry point for the inspection pipeline bootstrap."""
 
 import os
+from datetime import datetime
+from time import perf_counter
 
 import cv2
 from ultralytics import YOLO
@@ -19,12 +21,16 @@ from config.settings import (
     IOU_THRESHOLD,
     LOG_DIR,
     MODEL_PATH,
+    RECORD,
+    RECORD_ALL_FRAMES,
     RECONNECT_DELAY,
     SHOW_WINDOW,
     USE_GPU,
+    VIDEOS_DIR,
 )
 from core.camera import CameraManager
 from core.fps import FpsTracker
+from core.recorder import VideoRecorder
 from detection.filter import LabelFilter
 from detection.parser import DetectionParser
 from detection.visualizer import FrameVisualizer
@@ -39,8 +45,21 @@ except ImportError:  # pragma: no cover - torch may be missing on some deploymen
     torch = None
 
 
+def _draw_fps(frame, fps: float) -> None:
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.2f}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def main() -> None:
-    ensure_directories(LOG_DIR, IMAGES_DIR)
+    ensure_directories(LOG_DIR, IMAGES_DIR, VIDEOS_DIR)
     logger = setup_logging(LOG_DIR)
 
     if os.getenv("STRICT_ENV_VALIDATION", "0") == "1":
@@ -63,10 +82,19 @@ def main() -> None:
     fps_tracker = FpsTracker(FPS_WINDOW)
     show_window = SHOW_WINDOW
     window_name = "Camera Preview"
+    if show_window:
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        except cv2.error as exc:
+            logger.warning("OpenCV window setup unavailable: %s", exc)
+            show_window = False
     parser = DetectionParser()
     label_filter = LabelFilter()
     visualizer = FrameVisualizer()
     uploader = UploadPipeline(logger)
+    recorder = None
+    record_enabled = RECORD
+    record_all_frames = RECORD_ALL_FRAMES
 
     device = "cpu"
     if USE_GPU and torch is not None:
@@ -91,8 +119,13 @@ def main() -> None:
         logger.warning("Unable to move model to %s: %s", device, exc)
 
     frame_index = 0
+    total_frames = 0
+    pre_record_time = 0.0
+    total_time = 0.0
+    recorded_frames = 0
     try:
         while True:
+            loop_start = perf_counter()
             frame = camera.read_frame()
             if frame is None:
                 if camera.is_finished():
@@ -100,6 +133,31 @@ def main() -> None:
                     break
                 logger.warning("No frame retrieved from camera. Retrying...")
                 continue
+
+            if record_enabled and recorder is None:
+                fps_source = camera.get_fps() or 30.0
+                height, width = frame.shape[:2]
+                output_name = datetime.now().strftime("recording_%Y%m%d_%H%M%S.mp4")
+                output_path = os.path.join(VIDEOS_DIR, output_name)
+                try:
+                    recorder = VideoRecorder(
+                        output_path,
+                        fps_source,
+                        (width, height),
+                        logger=logger,
+                    )
+                    recorder.start()
+                    logger.info(
+                        "Recording enabled path=%s fps=%.2f size=%sx%s",
+                        output_path,
+                        fps_source,
+                        width,
+                        height,
+                    )
+                except Exception as exc:
+                    logger.warning("Recording disabled: %s", exc)
+                    recorder = None
+                    record_enabled = False
 
             frame_index += 1
             try:
@@ -125,18 +183,23 @@ def main() -> None:
                 uploader.process_frame(frame, filtered, frame_index)
 
             fps = fps_tracker.update()
+            should_record = (
+                record_enabled
+                and recorder is not None
+                and (record_all_frames or bool(filtered))
+            )
+
+            if show_window or should_record:
+                _draw_fps(frame, fps)
+
+            after_processing = perf_counter()
+
+            if should_record and recorder is not None:
+                recorder.submit(frame.copy())
+                recorded_frames += 1
+
             if show_window:
                 try:
-                    cv2.putText(
-                        frame,
-                        f"FPS: {fps:.2f}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 255, 0),
-                        2,
-                        cv2.LINE_AA,
-                    )
                     cv2.imshow(window_name, frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         logger.info("Exit requested by user (q)")
@@ -148,10 +211,27 @@ def main() -> None:
                         cv2.destroyAllWindows()
                     except cv2.error:
                         pass
+
+            loop_end = perf_counter()
+            total_frames += 1
+            pre_record_time += after_processing - loop_start
+            total_time += loop_end - loop_start
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
+        if total_frames:
+            avg_pre = total_frames / pre_record_time if pre_record_time > 0 else 0.0
+            avg_total = total_frames / total_time if total_time > 0 else 0.0
+            logger.info(
+                "FPS summary avg_pre_record=%.2f avg_total=%.2f drop=%.2f recorded_frames=%s",
+                avg_pre,
+                avg_total,
+                max(0.0, avg_pre - avg_total),
+                recorded_frames,
+            )
         uploader.flush()
+        if recorder is not None:
+            recorder.stop()
         camera.release()
         if show_window:
             try:

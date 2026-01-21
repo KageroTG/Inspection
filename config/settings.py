@@ -11,6 +11,7 @@ load_dotenv()
 
 LOG_DIR = "logs"
 IMAGES_DIR = "images"
+VIDEOS_DIR = "videos"
 
 MODEL_PATH = os.getenv("MODEL_PATH", "best_8n_8.2.pt")
 CAMERA_SOURCE_RAW = os.getenv("CAMERA_SOURCE", "Ipoh to KL - 15minutes.mp4")
@@ -23,6 +24,8 @@ UPLOAD_WORKERS = max(2, int(os.getenv("UPLOAD_WORKERS", "4")))
 CRACK_UPLOAD_DELAY = float(os.getenv("CRACK_UPLOAD_DELAY", "5.0"))
 PERF_LOG_INTERVAL = float(os.getenv("PERF_LOG_INTERVAL", "10.0"))
 SHOW_WINDOW = os.getenv("SHOW_WINDOW", "1") == "1"
+RECORD = os.getenv("RECORD", "0") == "1"
+RECORD_ALL_FRAMES = os.getenv("RECORD_ALL_FRAMES", "1") == "1"
 
 # Detection configuration
 
