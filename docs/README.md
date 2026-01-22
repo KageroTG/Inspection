@@ -7,13 +7,14 @@ This repo is being migrated to a modular structure. For now it includes a minima
 `main.py` performs a lightweight startup sequence and runs the camera + detection loop:
 
 - Loads environment variables from `.env` if present.
-- Ensures runtime directories exist (`logs/`, `images/`).
+- Ensures runtime directories exist (`logs/`, `images/`, `videos/`).
 - Configures logging to both console and a timestamped log file.
 - Optionally validates required environment variables when `STRICT_ENV_VALIDATION=1`.
 - Opens the configured camera source and (optionally) shows frames when `SHOW_WINDOW=1`.
 - Tracks FPS with a rolling window size defined by `FPS_WINDOW`.
 - Runs YOLO inference, parses detections, filters labels, and draws annotations.
 - Uploads annotated frames for immediate labels and debounces crack uploads.
+- Optionally records raw video frames when `RECORD=1` and logs an FPS summary on shutdown.
 
 Run the bootstrap:
 
@@ -59,12 +60,23 @@ STRICT_ENV_VALIDATION=1 python main.py
 - Centralizes runtime flags and environment-derived settings.
 - Calls `load_dotenv()` so `.env` values are available across modules.
 
+### Recording settings
+
+Set this in `.env`:
+
+- `RECORD=1` to enable recording (default off). When enabled, raw frames are recorded (no overlays).
+
 ## Core
 
 ### `core/camera.py`
 
 - Wraps OpenCV capture for RTSP, USB indexes, and local video files.
 - Includes basic reconnect behavior and end-of-file handling.
+
+### `core/recorder.py`
+
+- Threaded video recorder using OpenCV `VideoWriter`.
+- Saves a single raw `.mp4` per run under `videos/` when recording is enabled.
 
 ## Detection
 
