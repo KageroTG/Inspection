@@ -22,7 +22,6 @@ from config.settings import (
     LOG_DIR,
     MODEL_PATH,
     RECORD,
-    RECORD_ALL_FRAMES,
     RECONNECT_DELAY,
     SHOW_WINDOW,
     USE_GPU,
@@ -94,7 +93,6 @@ def main() -> None:
     uploader = UploadPipeline(logger)
     recorder = None
     record_enabled = RECORD
-    record_all_frames = RECORD_ALL_FRAMES
 
     device = "cpu"
     if USE_GPU and torch is not None:
@@ -183,11 +181,7 @@ def main() -> None:
                 uploader.process_frame(frame, filtered, frame_index)
 
             fps = fps_tracker.update()
-            should_record = (
-                record_enabled
-                and recorder is not None
-                and (record_all_frames or bool(filtered))
-            )
+            should_record = record_enabled and recorder is not None
 
             if show_window or should_record:
                 _draw_fps(frame, fps)

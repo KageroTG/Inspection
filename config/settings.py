@@ -25,7 +25,6 @@ CRACK_UPLOAD_DELAY = float(os.getenv("CRACK_UPLOAD_DELAY", "5.0"))
 PERF_LOG_INTERVAL = float(os.getenv("PERF_LOG_INTERVAL", "10.0"))
 SHOW_WINDOW = os.getenv("SHOW_WINDOW", "1") == "1"
 RECORD = os.getenv("RECORD", "0") == "1"
-RECORD_ALL_FRAMES = os.getenv("RECORD_ALL_FRAMES", "1") == "1"
 
 # Detection configuration
 

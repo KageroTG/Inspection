@@ -61,10 +61,9 @@ STRICT_ENV_VALIDATION=1 python main.py
 
 ### Recording settings
 
-Set these in `.env`:
+Set this in `.env`:
 
-- `RECORD=1` to enable recording (default off).
-- `RECORD_ALL_FRAMES=1` to record every frame (set `0` to record only frames with detections).
+- `RECORD=1` to enable recording (default off). When enabled, all frames are recorded.
 
 ## Core
 

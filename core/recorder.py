@@ -28,6 +28,7 @@ class VideoRecorder:
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._dropped = 0
         self._output_path = output_path
+        self._sentinel = object()
 
         writer = cv2.VideoWriter(
             output_path,
@@ -64,7 +65,8 @@ class VideoRecorder:
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._thread.join(timeout=5)
+        self._enqueue_sentinel()
+        self._thread.join()
         self._writer.release()
         if self._dropped:
             self._logger.warning(
@@ -73,12 +75,28 @@ class VideoRecorder:
             )
         self._logger.info("Recording saved to %s", self._output_path)
 
+    def _enqueue_sentinel(self) -> None:
+        while True:
+            try:
+                self._queue.put_nowait(self._sentinel)
+                return
+            except Full:
+                try:
+                    _ = self._queue.get_nowait()
+                    self._dropped += 1
+                except Empty:
+                    continue
+
     def _worker(self) -> None:
-        while not self._stop_event.is_set() or not self._queue.empty():
+        while True:
             try:
                 frame = self._queue.get(timeout=0.2)
             except Empty:
+                if self._stop_event.is_set():
+                    break
                 continue
+            if frame is self._sentinel:
+                break
             try:
                 self._writer.write(frame)
             except Exception as exc:
