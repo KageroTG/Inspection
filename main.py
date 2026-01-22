@@ -37,8 +37,8 @@ from upload.pipeline import UploadPipeline
 from utils.directories import ensure_directories
 from utils.logger import setup_logging
 from utils.validators import validate_environment
-import dotenv
-dotenv.load_dotenv()
+from dotenv import load_dotenv
+load_dotenv()
 
 try:
     import torch
