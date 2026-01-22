@@ -23,8 +23,21 @@ IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.4"))
 UPLOAD_WORKERS = max(2, int(os.getenv("UPLOAD_WORKERS", "4")))
 CRACK_UPLOAD_DELAY = float(os.getenv("CRACK_UPLOAD_DELAY", "5.0"))
 PERF_LOG_INTERVAL = float(os.getenv("PERF_LOG_INTERVAL", "10.0"))
-SHOW_WINDOW = os.getenv("SHOW_WINDOW", "1") == "1"
-RECORD = os.getenv("RECORD", "0") == "1"
+
+
+def _parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+SHOW_WINDOW = _parse_bool(os.getenv("SHOW_WINDOW"), True)
+RECORD = _parse_bool(os.getenv("RECORD"), False)
 
 # Detection configuration
 
@@ -62,7 +75,7 @@ AWS_BASE_URL = os.getenv(
 )
 
 # GPU configuration
-USE_GPU = os.getenv("USE_GPU", "1") == "1"
+USE_GPU = _parse_bool(os.getenv("USE_GPU"), True)
 
 FPS_WINDOW = int(os.getenv("FPS_WINDOW", "30"))
 
