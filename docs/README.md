@@ -14,7 +14,7 @@ This repo is being migrated to a modular structure. For now it includes a minima
 - Tracks FPS with a rolling window size defined by `FPS_WINDOW`.
 - Runs YOLO inference, parses detections, filters labels, and draws annotations.
 - Uploads annotated frames for immediate labels and debounces crack uploads.
-- Optionally records annotated video when `RECORD=1` and logs an FPS summary on shutdown.
+- Optionally records raw video frames when `RECORD=1` and logs an FPS summary on shutdown.
 
 Run the bootstrap:
 
@@ -64,7 +64,7 @@ STRICT_ENV_VALIDATION=1 python main.py
 
 Set this in `.env`:
 
-- `RECORD=1` to enable recording (default off). When enabled, all frames are recorded.
+- `RECORD=1` to enable recording (default off). When enabled, raw frames are recorded (no overlays).
 
 ## Core
 
@@ -76,7 +76,7 @@ Set this in `.env`:
 ### `core/recorder.py`
 
 - Threaded video recorder using OpenCV `VideoWriter`.
-- Saves a single `.mp4` per run under `videos/` when recording is enabled.
+- Saves a single raw `.mp4` per run under `videos/` when recording is enabled.
 
 ## Detection
 

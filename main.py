@@ -37,6 +37,8 @@ from upload.pipeline import UploadPipeline
 from utils.directories import ensure_directories
 from utils.logger import setup_logging
 from utils.validators import validate_environment
+import dotenv
+dotenv.load_dotenv()
 
 try:
     import torch
@@ -157,6 +159,10 @@ def main() -> None:
                     recorder = None
                     record_enabled = False
 
+            raw_frame = None
+            if record_enabled and recorder is not None:
+                raw_frame = frame.copy()
+
             frame_index += 1
             try:
                 results = model.track(
@@ -183,13 +189,13 @@ def main() -> None:
             fps = fps_tracker.update()
             should_record = record_enabled and recorder is not None
 
-            if show_window or should_record:
+            if show_window:
                 _draw_fps(frame, fps)
 
             after_processing = perf_counter()
 
-            if should_record and recorder is not None:
-                recorder.submit(frame.copy())
+            if should_record and raw_frame is not None:
+                recorder.submit(raw_frame)
                 recorded_frames += 1
 
             if show_window:
